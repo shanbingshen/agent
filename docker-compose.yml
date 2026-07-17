@@ -1,0 +1,75 @@
+services:
+  app-db:
+    image: pgvector/pgvector:0.8.0-pg16
+    environment:
+      POSTGRES_DB: arthra
+      POSTGRES_USER: arthra
+      POSTGRES_PASSWORD: arthra
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arthra -d arthra"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - arthra-db:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  thingsboard:
+    image: thingsboard/tb-postgres:4.2.1.1
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+      - "1883:1883"
+    volumes:
+      - thingsboard-data:/data
+      - thingsboard-logs:/var/log/thingsboard
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://arthra:arthra@app-db:5432/arthra
+      LANGGRAPH_DATABASE_URL: postgresql://arthra:arthra@app-db:5432/arthra
+      THINGSBOARD_URL: http://thingsboard:9090
+    depends_on:
+      app-db:
+        condition: service_healthy
+      thingsboard:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  simulator:
+    build:
+      context: .
+      dockerfile: services/simulator/Dockerfile
+    env_file: .env
+    environment:
+      THINGSBOARD_URL: http://thingsboard:9090
+      THINGSBOARD_MQTT_HOST: thingsboard
+    depends_on:
+      thingsboard:
+        condition: service_started
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:8000/api/v1
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  arthra-db:
+  thingsboard-data:
+  thingsboard-logs:
+
