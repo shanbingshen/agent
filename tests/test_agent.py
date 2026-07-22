@@ -3,6 +3,7 @@ from arthra.agent import (
     RouteDecision,
     build_graph,
     classify_route,
+    resolve_short_term_context,
     route_message,
     synthesize,
 )
@@ -16,6 +17,7 @@ from arthra.compressor.schemas import (
 )
 from arthra.config import Settings
 from arthra.contracts import AnalysisWarning
+from arthra.conversation_schemas import ConversationContext, ConversationTurn
 from arthra.power.schemas import (
     DemandMetrics,
     PowerAnalysisResult,
@@ -24,6 +26,7 @@ from arthra.power.schemas import (
     PowerDataQuality,
     PowerMetrics,
 )
+from arthra.question_answering import QueryTimeRange
 from langchain_core.messages import ToolMessage
 
 
@@ -348,7 +351,141 @@ def test_same_thread_can_run_twice_with_pydantic_state(monkeypatch):
 
     assert first["route"] == "power"
     assert second["route"] == "power"
+    assert isinstance(first["route_decision"], RouteDecision)
+    assert isinstance(second["route_decision"], RouteDecision)
     assert second["analysis"].method == "deterministic-first"
+
+
+def test_short_term_context_resolves_follow_up_scope_capability_and_time():
+    time_range = QueryTimeRange(
+        start_at="2026-07-20T16:00:00Z",
+        end_at="2026-07-21T16:00:00Z",
+        label="昨日00:00—24:00",
+    )
+    state = AgentState(
+        message="继续分析它",
+        page_workspace="compressor",
+        conversation_context=ConversationContext(
+            active_route="compressor",
+            active_intent="COMPRESSOR_UNLOAD_ANALYSIS",
+            active_device_scope=["compressor-1"],
+            active_capabilities=["load_rate"],
+            active_time_range=time_range,
+            active_workspace="compressor",
+            turns=[
+                ConversationTurn(
+                    user_message="分析昨天1号空压机的加载率",
+                    assistant_summary="已完成加载率分析。",
+                    route="compressor",
+                    intent="COMPRESSOR_UNLOAD_ANALYSIS",
+                    device_scope=["compressor-1"],
+                    capabilities=["load_rate"],
+                    time_range=time_range,
+                )
+            ],
+        ),
+    )
+
+    resolved = resolve_short_term_context(state)
+
+    assert resolved["context_applied"] is True
+    assert resolved["context_route_hint"] == "compressor"
+    assert resolved["context_intent_hint"] == "COMPRESSOR_UNLOAD_ANALYSIS"
+    assert resolved["context_capabilities"] == ["load_rate"]
+    assert resolved["context_time_range"] == time_range
+    assert resolved["device_scope"] == ["compressor-1"]
+
+
+def test_visible_page_time_scope_applies_when_question_has_no_time():
+    resolved = resolve_short_term_context(
+        AgentState(
+            message="分析这台空压机的加载率",
+            device_scope=["compressor-1"],
+            page_workspace="compressor",
+            page_time_scope="yesterday",
+        )
+    )
+
+    assert resolved["context_time_range"] is not None
+    assert resolved["context_time_range"].label == "昨日00:00—24:00"
+    assert resolved["context_time_range"].defaulted is False
+
+
+def test_same_thread_follow_up_uses_previous_expert_and_device_scope(monkeypatch):
+    monkeypatch.setattr("arthra.agent.get_settings", lambda: Settings(llm_api_key=""))
+    loaded_scopes: list[list[str]] = []
+
+    def loader(ids):
+        loaded_scopes.append(list(ids))
+        return [
+            {
+                "id": "compressor-1",
+                "name": "Arthra-Compressor-01",
+                "type": "compressor",
+                "telemetry": {
+                    "power_kw": 80.0,
+                    "pressure_bar": 7.0,
+                    "temperature_c": 65.0,
+                    "running": True,
+                },
+                "timestamps": {},
+            }
+        ]
+
+    graph = build_graph(telemetry_loader=loader)
+    config = {"configurable": {"thread_id": "context-follow-up-test"}}
+    first = graph.invoke(
+        {
+            "message": "分析空压机运行状态",
+            "device_scope": ["compressor-1"],
+            "page_workspace": "compressor",
+        },
+        config,
+    )
+    second = graph.invoke(
+        {
+            "message": "继续分析它",
+            "device_scope": [],
+            "page_workspace": "compressor",
+        },
+        config,
+    )
+
+    assert first["route"] == "compressor"
+    assert second["route"] == "compressor"
+    assert second["route_decision"]["source"] == "context"
+    assert second["device_scope"] == ["compressor-1"]
+    assert second["context_applied"] is True
+    assert len(second["conversation_context"].turns) == 2
+    assert loaded_scopes[-1] == ["compressor-1"]
+
+
+def test_explicit_new_domain_overrides_previous_conversation_context(monkeypatch):
+    monkeypatch.setattr("arthra.agent.get_settings", lambda: Settings(llm_api_key=""))
+    graph = build_graph(
+        telemetry_loader=lambda ids: [
+            {
+                "id": ids[0],
+                "name": "Selected Device",
+                "type": "meter" if ids[0] == "meter-1" else "compressor",
+                "telemetry": {"meter_TotW": 100.0, "running": True},
+                "timestamps": {},
+            }
+        ]
+    )
+    config = {"configurable": {"thread_id": "context-domain-switch-test"}}
+    graph.invoke(
+        {"message": "分析空压机", "device_scope": ["compressor-1"]},
+        config,
+    )
+    result = graph.invoke(
+        {"message": "分析电表功率", "device_scope": ["meter-1"]},
+        config,
+    )
+
+    assert result["route"] == "power"
+    assert result["route_decision"]["source"] == "keyword"
+    assert result["device_scope"] == ["meter-1"]
 
 
 def test_production_compressor_branch_executes_selected_tools_through_tool_node(monkeypatch):
@@ -549,10 +686,45 @@ def test_specialist_model_failure_keeps_deterministic_response(monkeypatch):
         ),
     )
 
-    response = synthesize(state)["response"]
+    result = synthesize(state)
+    response = result["response"]
 
     assert "功率因数 0.955" in response
     assert "千问专家解读" not in response
+    assert result["expert_supplement_status"] == "unavailable"
+
+
+def test_empty_quoted_specialist_supplement_is_hidden(monkeypatch):
+    class EmptyResponse:
+        content = '""'
+
+    class EmptyModel:
+        def __init__(self, **kwargs):
+            pass
+
+        def invoke(self, messages):
+            return EmptyResponse()
+
+    monkeypatch.setattr(
+        "arthra.agent.get_settings",
+        lambda: Settings(llm_api_key="test-key", llm_model="qwen-test"),
+    )
+    monkeypatch.setattr("arthra.agent.ChatOpenAI", EmptyModel)
+    result = synthesize(
+        AgentState(
+            message="分析功率因数",
+            device_scope=["meter-1"],
+            analysis=PowerAnalysisResult(
+                data_status="available",
+                capabilities=["power_factor"],
+                findings=["功率因数 0.955。"],
+                confidence=1,
+            ),
+        )
+    )
+
+    assert "专家补充" not in result["response"]
+    assert result["expert_supplement_status"] == "empty"
 
 
 def test_customer_power_report_uses_rolling_demand_and_hides_internal_details(monkeypatch):

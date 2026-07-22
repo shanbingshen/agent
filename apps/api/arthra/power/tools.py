@@ -32,7 +32,7 @@ TOOL_CAPABILITIES: dict[str, tuple[PowerCapability, str, str]] = {
     "calculate_rolling_15m_max_demand": ("demand_15m", "计算15分钟滚动最大需量", "按历史有功功率计算15分钟滚动平均与最大需量。"),
     "detect_power_peaks": ("peak_detection", "识别负荷峰值", "识别历史有功功率序列中的局部负荷峰值。"),
     "analyze_peak_average_ratio": ("peak_average_ratio", "分析峰均比", "计算负荷峰值与窗口平均负荷之比。"),
-    "detect_declared_demand_exceedance": ("declared_demand_exceedance", "识别申报需量越限", "将15分钟滚动需量与申报需量比较并计算越限时长。"),
+    "detect_declared_demand_exceedance": ("declared_demand_exceedance", "识别需量控制目标越限", "将15分钟滚动需量与需量控制目标比较并计算越限时长。"),
     "detect_voltage_deviation": ("voltage_deviation", "识别电压偏差", "按额定线电压计算三相线电压偏差与越限时长。"),
     "detect_three_phase_imbalance": ("phase_imbalance", "识别三相不平衡", "分析电压和电流不平衡度及越限持续时间。"),
     "detect_power_factor_anomaly": ("power_factor", "识别功率因数异常", "识别总功率因数低于阈值的时间区间。"),

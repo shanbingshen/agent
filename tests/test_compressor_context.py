@@ -103,6 +103,8 @@ def test_context_layer_links_meter_and_computes_core_capabilities():
     assert compressor["unload_rate_pct"] == 20.0
     assert compressor["idle_running_minutes"] == 10.0
     assert compressor["longest_idle_running_minutes"] == 10.0
+    assert compressor["idle_event_count"] == 1
+    assert len(compressor["idle_periods"]) == 1
     assert compressor["start_count"] == 2
     assert compressor["start_observation_hours"] == 0.917
     assert compressor["starts_per_hour"] == 2.182
@@ -136,6 +138,7 @@ def test_idle_warning_uses_longest_continuous_period_not_cumulative_minutes():
 
     assert result.metrics.devices["compressor-1"].idle_running_minutes == 10.0
     assert result.metrics.devices["compressor-1"].longest_idle_running_minutes == 10.0
+    assert result.metrics.devices["compressor-1"].idle_event_count == 1
     assert not any(
         warning.code == "EXCESSIVE_CONTINUOUS_IDLE_RUNNING"
         for warning in result.warnings

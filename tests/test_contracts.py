@@ -3,7 +3,7 @@ from arthra.agent import SemanticRouteOutput
 from arthra.api import sse, tool_event_content
 from arthra.compressor.schemas import CompressorAnalysisRequest
 from arthra.main import app
-from arthra.schemas import ChatRequest, ControlPlanCreate
+from arthra.schemas import ChatFeedbackCreate, ChatRequest, ControlPlanCreate
 from arthra.thingsboard_schemas import TelemetryHistory
 from langchain_core.messages import ToolMessage
 from pydantic import ValidationError
@@ -19,6 +19,69 @@ def test_public_requests_forbid_unknown_fields():
                 "unexpected": True,
             }
         )
+
+
+def test_chat_page_context_accepts_only_known_workspaces():
+    request = ChatRequest.model_validate(
+        {
+            "thread_id": "workspace-context-test",
+            "message": "继续分析",
+            "device_scope": [],
+            "page_context": {
+                "selected_device_ids": ["compressor-1"],
+                "workspace": "compressor",
+                "time_scope": "yesterday",
+            },
+        }
+    )
+    assert request.page_context is not None
+    assert request.page_context.workspace == "compressor"
+    assert request.page_context.time_scope == "yesterday"
+
+    with pytest.raises(ValidationError):
+        ChatRequest.model_validate(
+            {
+                "thread_id": "invalid-workspace-test",
+                "message": "继续分析",
+                "page_context": {
+                    "selected_device_ids": [],
+                    "workspace": "invented-workspace",
+                },
+            }
+        )
+
+    with pytest.raises(ValidationError):
+        ChatRequest.model_validate(
+            {
+                "thread_id": "invalid-time-scope-test",
+                "message": "继续分析",
+                "page_context": {
+                    "selected_device_ids": [],
+                    "workspace": "compressor",
+                    "time_scope": "last_30d",
+                },
+            }
+        )
+
+
+def test_chat_feedback_requires_reason_for_improvement():
+    with pytest.raises(ValidationError):
+        ChatFeedbackCreate(
+            request_id="request-1",
+            thread_id="thread-1",
+            message_id="message-1",
+            rating="needs_improvement",
+            reasons=[],
+        )
+
+    feedback = ChatFeedbackCreate(
+        request_id="request-1",
+        thread_id="thread-1",
+        message_id="message-1",
+        rating="needs_improvement",
+        reasons=["missing_evidence"],
+    )
+    assert feedback.reasons == ["missing_evidence"]
 
 
 def test_supervisor_output_rejects_unknown_route_and_fields():

@@ -138,8 +138,8 @@ INTENTS: dict[QuestionIntent, IntentDefinition] = {
         requires_device=True, uses_realtime=True, max_tool_calls=1,
     ),
     "COMPRESSOR_UNLOAD_ANALYSIS": IntentDefinition(
-        intent="COMPRESSOR_UNLOAD_ANALYSIS", route="compressor", capabilities=["load_rate"],
-        requires_device=True, use_llm_explanation=True, max_tool_calls=1,
+        intent="COMPRESSOR_UNLOAD_ANALYSIS", route="compressor", capabilities=["load_rate", "idle_running"],
+        requires_device=True, use_llm_explanation=True, max_tool_calls=2,
     ),
     "COMPRESSOR_FREQUENT_START_STOP": IntentDefinition(
         intent="COMPRESSOR_FREQUENT_START_STOP", route="compressor", capabilities=["frequent_start"],
@@ -175,8 +175,22 @@ INTENTS: dict[QuestionIntent, IntentDefinition] = {
         requires_device=True, use_llm_explanation=True, max_tool_calls=1,
     ),
     "CROSS_ENERGY_CONTRIBUTION": IntentDefinition(intent="CROSS_ENERGY_CONTRIBUTION", route="conversation"),
-    "GENERAL_POWER_ANALYSIS": IntentDefinition(intent="GENERAL_POWER_ANALYSIS", route="power", requires_device=True),
-    "GENERAL_COMPRESSOR_ANALYSIS": IntentDefinition(intent="GENERAL_COMPRESSOR_ANALYSIS", route="compressor", requires_device=True),
+    "GENERAL_POWER_ANALYSIS": IntentDefinition(
+        intent="GENERAL_POWER_ANALYSIS",
+        route="power",
+        capabilities=["realtime_power", "demand_15m", "power_factor", "phase_imbalance"],
+        requires_device=True,
+        use_llm_explanation=True,
+        max_tool_calls=4,
+    ),
+    "GENERAL_COMPRESSOR_ANALYSIS": IntentDefinition(
+        intent="GENERAL_COMPRESSOR_ANALYSIS",
+        route="compressor",
+        capabilities=["realtime_status", "energy_consumption", "load_rate", "pressure_fluctuation"],
+        requires_device=True,
+        use_llm_explanation=True,
+        max_tool_calls=4,
+    ),
     "GENERAL_ENERGY_ANALYSIS": IntentDefinition(intent="GENERAL_ENERGY_ANALYSIS", route="ems", requires_device=True),
     "UNKNOWN": IntentDefinition(
         intent="UNKNOWN", route="conversation", use_llm_explanation=True
@@ -221,7 +235,14 @@ def classify_question(message: str) -> IntentDefinition | None:
         return INTENTS["COMPRESSOR_SAVINGS_ESTIMATE"]
     if "空压" in text and _has(text, "漏气", "泄漏"):
         return INTENTS["COMPRESSOR_LEAKAGE_ANALYSIS"]
-    if "空压" in text and _has(text, "耗电高", "耗电这么高", "为什么耗电"):
+    if "空压" in text and _has(
+        text,
+        "耗电高",
+        "耗电这么高",
+        "为什么耗电",
+        "有没有耗电",
+        "耗电吗",
+    ):
         return INTENTS["COMPRESSOR_ENERGY_CAUSE"]
     if "空压" in text and _has(text, "比功率", "单位产气", "能效"):
         return INTENTS["COMPRESSOR_SPECIFIC_POWER"]
@@ -233,7 +254,15 @@ def classify_question(message: str) -> IntentDefinition | None:
         return INTENTS["COMPRESSOR_FREQUENT_START_STOP"]
     if "空压" in text and _has(text, "卸载", "加载率", "卸载率", "空载"):
         return INTENTS["COMPRESSOR_UNLOAD_ANALYSIS"]
-    if "空压" in text and _has(text, "正常吗", "运行状态", "当前状态", "现在运行"):
+    if "空压" in text and _has(
+        text,
+        "正常吗",
+        "运行状态",
+        "运行状况",
+        "运行情况",
+        "当前状态",
+        "现在运行",
+    ):
         return INTENTS["COMPRESSOR_STATUS_QUERY"]
     if _has(text, "三相不平衡", "电流不平衡", "电压不平衡"):
         return INTENTS["CURRENT_UNBALANCE_ANALYSIS"]
