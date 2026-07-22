@@ -6,6 +6,8 @@
 
 - `apps/api/arthra/agent.py` 只负责能力路由、专家状态和语言解释；确定性计算不得交给 LLM。
 - `apps/api/arthra/thingsboard.py` 是唯一允许持有 ThingsBoard 管理凭据的模块。
+- Agent、领域上下文、日报和只读 API 只能通过 `apps/api/arthra/industrial_data` 读取工业数据；禁止直接依赖具体数据源客户端。
+- 新数据源必须实现 `IndustrialDataAdapter`，并在适配器边界转换为统一 Pydantic 模型；领域工具不得按 provider 分支。
 - `apps/api/arthra/control.py` 是唯一允许调用 `send_rpc` 的业务模块。
 - Agent 工具只能读取设备数据或创建 `proposed` 控制计划，禁止直接执行 RPC、属性写入或绕过审批。
 - 前端权限提示不是安全措施；所有权限与状态转换必须由 API 再次验证。
@@ -38,6 +40,9 @@ docker compose up -d --build
 - 设备数值计算必须可复现、可单测，并保留单位；LLM 输出不得作为控制数值的唯一来源。
 - 外部 HTTP 调用设置超时并转换为领域异常；RPC 失败不得自动无限重试。
 - 新专家必须声明输入数据、确定性分析步骤、输出结构和允许调用的只读工具。
+- 空压机与电力专家的 LLM 只能解释已经校验的 Pydantic 确定性结果；不得重新计算、覆盖或补造指标、阈值、告警和节能量，模型失败时必须保留确定性报告。
+- 客户模式不得展示基础模型名、设备 UUID、原始点位键、内部规则码或数值置信度；管理员调试模式必须由 API 校验角色后显式开启。
+- 需量越限只能使用15分钟滚动需量与申报需量比较，禁止使用实时功率或统计周期不明的电表需量寄存器替代。
 
 ## TypeScript 规范
 
@@ -59,6 +64,15 @@ docker compose up -d --build
 - 保持一次 401 后重新认证的有限重试；其他错误立即转为 `ThingsBoardError`。
 - 新控制方法默认拒绝。启用时必须同时更新环境白名单、`ControlPolicy` 参数校验、测试和 README。
 - 模拟器设备类型保持 `ems`、`meter`、`compressor`，遥测 key 变更必须同步 API 示例和前端。
+- ThingsBoard 只读能力由 `ThingsBoardIndustrialDataAdapter` 接入统一工业数据服务；设备控制仍由 `ControlService` 独立校验后调用 RPC。
+
+## 统一工业数据接口
+
+- `industrial_data/schemas.py` 是设备、遥测、属性和告警的源无关契约，时间戳统一使用 UTC 毫秒。
+- `industrial_data/ports.py` 定义只读数据源 Protocol；适配器必须支持设备分页、最新遥测、历史时序、属性和告警。
+- 时序 API 必须返回规范 pointCode 和单位语义；字段映射、单位换算与第三方响应兼容只能发生在适配器内。
+- `meter_TotW` 统一为 kW，缺失值不得补零，布尔值不得作为数值，聚合方式和时间桶必须透传且可审计。
+- `INDUSTRIAL_DATA_PROVIDER` 切换数据源时，Agent 图、能力工具和确定性算法不得修改。
 
 ## 测试与验收
 

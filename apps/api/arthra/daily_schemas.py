@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import Field
 
 from arthra.contracts import AnalysisWarning, StrictModel
@@ -11,6 +13,9 @@ class HistoryMetric(StrictModel):
     max: float
     avg: float
     delta: float
+    first_ts: int | None = Field(default=None, ge=0)
+    latest_ts: int | None = Field(default=None, ge=0)
+    observed_hours: float | None = Field(default=None, ge=0)
     latest_bucket_avg: float | None = None
 
 
@@ -38,7 +43,11 @@ class DailyOverview(StrictModel):
     warning_count: int = Field(ge=0)
     alarm_count: int = Field(ge=0)
     average_active_power_kw: float | None = None
+    active_power_data_coverage: float | None = Field(default=None, ge=0, le=1)
     energy_consumption_kwh: float | None = Field(default=None, ge=0)
+    energy_consumption_status: Literal[
+        "available", "partial", "unavailable", "invalid"
+    ] = "unavailable"
 
 
 class DailySnapshot(StrictModel):
@@ -48,4 +57,3 @@ class DailySnapshot(StrictModel):
     missing_metrics: list[str]
     warnings: list[AnalysisWarning]
     thingsboard_alarms: list[DailyAlarm]
-

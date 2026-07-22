@@ -11,7 +11,11 @@ from arthra.compressor.schemas import (
     AirSystemDevice,
     CompressorAnalysisRequest,
     CompressorAnalysisResult,
+    CompressorCapability,
     CompressorSystemContext,
+    LoadUnloadRateDeviceResult,
+    LoadUnloadRateToolInput,
+    LoadUnloadRateToolResult,
     SignalPoint,
 )
 from arthra.config import Settings, get_settings
@@ -78,6 +82,13 @@ def _longest_active_minutes(points: list[SignalPoint], interval_seconds: int) ->
     return round(longest, 2)
 
 
+def _observation_hours(points: list[SignalPoint]) -> float | None:
+    if len(points) < 2:
+        return None
+    duration_ms = points[-1].ts - points[0].ts
+    return duration_ms / 3_600_000 if duration_ms > 0 else None
+
+
 def _linked_meter(context: CompressorSystemContext, compressor: AirSystemDevice) -> AirSystemDevice | None:
     linked_id = compressor.attributes.get("linkedMeterDeviceId")
     if linked_id:
@@ -87,6 +98,136 @@ def _linked_meter(context: CompressorSystemContext, compressor: AirSystemDevice)
     return context.meters[0] if len(context.meters) == 1 else None
 
 
+def analyze_load_unload_rate_context(
+    context: CompressorSystemContext,
+    settings: Settings | None = None,
+) -> LoadUnloadRateToolResult:
+    settings = settings or get_settings()
+    interval_ms = context.interval_seconds * 1000
+    expected_samples = max(
+        1,
+        math.ceil((context.end_ts - context.start_ts) / interval_ms),
+    )
+    requested_ids = set(context.requested_device_scope)
+    compressors = [
+        compressor
+        for compressor in context.compressors
+        if not requested_ids or compressor.device_id in requested_ids
+    ]
+    devices: list[LoadUnloadRateDeviceResult] = []
+    warnings: list[dict[str, Any]] = []
+    missing: list[str] = []
+
+    for compressor in compressors:
+        running = _points(compressor, "air_comp_running_flag")
+        loaded = _points(compressor, "air_comp_loaded_flag")
+        aligned = _aligned(running, loaded, interval_ms)
+        running_units = sum(max(0.0, min(1.0, run)) for _, run, _ in aligned)
+        loaded_units = sum(
+            min(max(0.0, min(1.0, run)), max(0.0, min(1.0, load)))
+            for _, run, load in aligned
+        )
+        method = None
+        load_rate = None
+        running_minutes = None
+        loaded_minutes = None
+        coverage = min(1.0, len(aligned) / expected_samples)
+
+        if aligned and running_units > 0:
+            method = "aligned-state-ratio"
+            load_rate = loaded_units / running_units * 100
+            running_minutes = running_units * context.interval_seconds / 60
+            loaded_minutes = loaded_units * context.interval_seconds / 60
+        else:
+            running_hours = _points(compressor, "air_comp_running_hours")
+            loading_hours = _points(compressor, "air_comp_loading_hours")
+            running_delta = _delta(running_hours)
+            loading_delta = _delta(loading_hours)
+            counter_samples = min(len(running_hours), len(loading_hours))
+            coverage = min(1.0, counter_samples / expected_samples)
+            if running_delta is not None and running_delta > 0 and loading_delta is not None:
+                method = "cumulative-hours-delta"
+                load_rate = loading_delta / running_delta * 100
+                running_minutes = running_delta * 60
+                loaded_minutes = min(loading_delta, running_delta) * 60
+
+        if load_rate is None or running_minutes is None or loaded_minutes is None:
+            reason = f"{compressor.device_name}: 加载/运行状态历史或累计小时差值"
+            missing.append(reason)
+            devices.append(
+                LoadUnloadRateDeviceResult(
+                    device_id=compressor.device_id,
+                    device_name=compressor.device_name,
+                    data_status="unavailable",
+                    aligned_sample_count=len(aligned),
+                    sample_coverage=round(coverage, 4),
+                    unload_warning_threshold_pct=settings.compressor_unload_rate_warning_pct,
+                    missing_metrics=[reason],
+                )
+            )
+            continue
+
+        load_rate = max(0.0, min(100.0, load_rate))
+        unload_rate = 100 - load_rate
+        unloaded_minutes = max(0.0, running_minutes - loaded_minutes)
+        exceeds_threshold = unload_rate >= settings.compressor_unload_rate_warning_pct
+        if exceeds_threshold:
+            warnings.append(
+                {
+                    "severity": "medium",
+                    "code": "HIGH_UNLOAD_RATE",
+                    "device_id": compressor.device_id,
+                    "device_name": compressor.device_name,
+                    "message": (
+                        f"卸载率 {unload_rate:.2f}% 高于配置阈值 "
+                        f"{settings.compressor_unload_rate_warning_pct:.0f}%"
+                    ),
+                    "evidence": {
+                        "load_rate_pct": round(load_rate, 2),
+                        "unload_rate_pct": round(unload_rate, 2),
+                        "sample_coverage": round(coverage, 4),
+                    },
+                }
+            )
+        devices.append(
+            LoadUnloadRateDeviceResult(
+                device_id=compressor.device_id,
+                device_name=compressor.device_name,
+                data_status="available",
+                calculation_method=method,
+                load_rate_pct=round(load_rate, 2),
+                unload_rate_pct=round(unload_rate, 2),
+                aligned_sample_count=len(aligned),
+                running_minutes=round(running_minutes, 2),
+                loaded_minutes=round(loaded_minutes, 2),
+                unloaded_minutes=round(unloaded_minutes, 2),
+                sample_coverage=round(coverage, 4),
+                unload_warning_threshold_pct=settings.compressor_unload_rate_warning_pct,
+                exceeds_unload_warning_threshold=exceeds_threshold,
+            )
+        )
+
+    available_count = sum(device.data_status == "available" for device in devices)
+    if not devices or available_count == 0:
+        data_status = "unavailable"
+    elif available_count < len(devices) or any(
+        device.sample_coverage < settings.compressor_min_data_coverage for device in devices
+    ):
+        data_status = "partial"
+    else:
+        data_status = "available"
+    return LoadUnloadRateToolResult(
+        air_system_id=context.air_system_id,
+        start_ts=context.start_ts,
+        end_ts=context.end_ts,
+        interval_seconds=context.interval_seconds,
+        data_status=data_status,
+        devices=devices,
+        warnings=warnings,
+        missing_metrics=missing,
+    )
+
+
 def _analyze_operation(
     context: CompressorSystemContext,
     settings: Settings,
@@ -94,48 +235,47 @@ def _analyze_operation(
     findings: list[str],
     warnings: list[dict[str, Any]],
     missing: list[str],
+    capabilities: list[str],
 ) -> None:
-    window_hours = (context.end_ts - context.start_ts) / 3_600_000
     device_metrics: dict[str, dict[str, Any]] = {}
-    for compressor in context.compressors:
-        item: dict[str, Any] = {"device_name": compressor.device_name}
-        running = _points(compressor, "air_comp_running_flag")
-        loaded = _points(compressor, "air_comp_loaded_flag")
-        unloaded = _points(compressor, "air_comp_unloaded_running_flag")
-        running_ratio = _mean(running)
-        loaded_ratio = _mean(loaded)
-        if running_ratio is not None and loaded_ratio is not None and running_ratio > 0:
-            load_rate = max(0.0, min(100.0, loaded_ratio / running_ratio * 100))
-            unload_rate = 100 - load_rate
-        else:
-            running_delta = _delta(_points(compressor, "air_comp_running_hours"))
-            loading_delta = _delta(_points(compressor, "air_comp_loading_hours"))
-            if running_delta and loading_delta is not None:
-                load_rate = max(0.0, min(100.0, loading_delta / running_delta * 100))
-                unload_rate = 100 - load_rate
-            else:
-                load_rate = unload_rate = None
-        if load_rate is not None:
-            item["load_rate_pct"] = round(load_rate, 2)
-            item["unload_rate_pct"] = round(unload_rate, 2)
-            findings.append(
-                f"{compressor.device_name}: 运行期间加载率 {load_rate:.2f}%，卸载率 {unload_rate:.2f}%"
-            )
-            if unload_rate >= settings.compressor_unload_rate_warning_pct:
-                warnings.append(
-                    {
-                        "severity": "medium",
-                        "code": "HIGH_UNLOAD_RATE",
-                        "device_id": compressor.device_id,
-                        "device_name": compressor.device_name,
-                        "message": f"卸载率 {unload_rate:.2f}% 高于配置阈值 {settings.compressor_unload_rate_warning_pct:.0f}%",
-                        "evidence": {"load_rate_pct": round(load_rate, 2), "unload_rate_pct": round(unload_rate, 2)},
-                    }
-                )
-        else:
-            missing.append(f"{compressor.device_name}: 加载/运行状态历史或累计小时差值")
 
-        if unloaded:
+    if "load_rate" in capabilities:
+        load_result = analyze_load_unload_rate_context(context, settings)
+        warnings.extend(warning.model_dump(mode="json") for warning in load_result.warnings)
+        missing.extend(load_result.missing_metrics)
+        for result in load_result.devices:
+            item = device_metrics.setdefault(
+                result.device_id,
+                {"device_name": result.device_name},
+            )
+            if result.data_status != "available":
+                continue
+            item.update(
+                {
+                    "load_rate_pct": result.load_rate_pct,
+                    "unload_rate_pct": result.unload_rate_pct,
+                    "load_unload_method": result.calculation_method,
+                    "aligned_sample_count": result.aligned_sample_count,
+                    "running_minutes": result.running_minutes,
+                    "loaded_minutes": result.loaded_minutes,
+                    "unloaded_minutes": result.unloaded_minutes,
+                    "sample_coverage": result.sample_coverage,
+                }
+            )
+            findings.append(
+                f"{result.device_name}: 运行期间加载率 {result.load_rate_pct:.2f}%，"
+                f"卸载率 {result.unload_rate_pct:.2f}%（{result.calculation_method}）"
+            )
+
+    for compressor in context.compressors:
+        if context.requested_device_scope and compressor.device_id not in context.requested_device_scope:
+            continue
+        item = device_metrics.setdefault(
+            compressor.device_id,
+            {"device_name": compressor.device_name},
+        )
+        unloaded = _points(compressor, "air_comp_unloaded_running_flag")
+        if "idle_running" in capabilities and unloaded:
             idle_minutes = sum(point.value for point in unloaded) * context.interval_seconds / 60
             longest_idle = _longest_active_minutes(unloaded, context.interval_seconds)
             item["idle_running_minutes"] = round(idle_minutes, 2)
@@ -143,27 +283,45 @@ def _analyze_operation(
             findings.append(
                 f"{compressor.device_name}: 窗口内卸载空载约 {idle_minutes:.2f} min，最长连续约 {longest_idle:.2f} min"
             )
-            if idle_minutes >= settings.compressor_idle_warning_minutes:
+            if longest_idle >= settings.compressor_idle_warning_minutes:
                 warnings.append(
                     {
                         "severity": "medium",
-                        "code": "EXCESSIVE_IDLE_RUNNING",
+                        "code": "EXCESSIVE_CONTINUOUS_IDLE_RUNNING",
                         "device_id": compressor.device_id,
                         "device_name": compressor.device_name,
-                        "message": f"卸载空载时间约 {idle_minutes:.2f} min",
-                        "evidence": {"idle_running_minutes": round(idle_minutes, 2), "longest_idle_minutes": longest_idle},
+                        "message": f"最长连续卸载空载约 {longest_idle:.2f} min",
+                        "evidence": {
+                            "idle_running_minutes": round(idle_minutes, 2),
+                            "longest_idle_minutes": longest_idle,
+                            "continuous_idle_threshold_minutes": settings.compressor_idle_warning_minutes,
+                        },
                     }
                 )
-        else:
+        elif "idle_running" in capabilities:
             missing.append(f"{compressor.device_name}: air_comp_unloaded_running_flag")
 
-        starts = _delta(_points(compressor, "air_comp_start_count"))
-        if starts is not None:
-            starts_per_hour = starts / window_hours if window_hours else 0
+        start_points = (
+            _points(compressor, "air_comp_start_count")
+            if "frequent_start" in capabilities
+            else []
+        )
+        starts = _delta(start_points) if start_points else None
+        observation_hours = _observation_hours(start_points)
+        if (
+            "frequent_start" in capabilities
+            and starts is not None
+            and observation_hours is not None
+        ):
+            starts_per_hour = starts / observation_hours
             item["start_count"] = round(starts)
+            item["start_observation_hours"] = (
+                round(observation_hours, 3)
+            )
             item["starts_per_hour"] = round(starts_per_hour, 3)
             findings.append(
-                f"{compressor.device_name}: 窗口内启动约 {round(starts)} 次（{starts_per_hour:.3f} 次/h）"
+                f"{compressor.device_name}: 有效观测 {observation_hours:.2f} h 内启动约 "
+                f"{round(starts)} 次（{starts_per_hour:.3f} 次/h）"
             )
             if starts_per_hour >= settings.compressor_frequent_starts_per_hour:
                 warnings.append(
@@ -173,13 +331,101 @@ def _analyze_operation(
                         "device_id": compressor.device_id,
                         "device_name": compressor.device_name,
                         "message": f"启动频率 {starts_per_hour:.3f} 次/h 超过配置阈值",
-                        "evidence": {"start_count": round(starts), "window_hours": round(window_hours, 2)},
+                        "evidence": {
+                            "start_count": round(starts),
+                            "observation_hours": round(observation_hours, 3),
+                        },
                     }
                 )
-        else:
+        elif "frequent_start" in capabilities:
             missing.append(f"{compressor.device_name}: air_comp_start_count 历史")
-        device_metrics[compressor.device_id] = item
     metrics["devices"] = device_metrics
+
+
+def _numeric_latest(device: AirSystemDevice, key: str) -> float | None:
+    value = device.latest.get(key)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _analyze_realtime_status(
+    context: CompressorSystemContext,
+    metrics: dict[str, Any],
+    findings: list[str],
+    missing: list[str],
+) -> None:
+    realtime: dict[str, dict[str, Any]] = {}
+    for compressor in context.compressors:
+        if context.requested_device_scope and compressor.device_id not in context.requested_device_scope:
+            continue
+        running_value = _numeric_latest(compressor, "air_comp_running_flag")
+        loaded_value = _numeric_latest(compressor, "air_comp_loaded_flag")
+        pressure = _numeric_latest(compressor, "air_comp_supply_pressure")
+        temperature = _numeric_latest(compressor, "air_comp_discharge_temp")
+        meter = _linked_meter(context, compressor)
+        power = _numeric_latest(meter, "meter_TotW") if meter else None
+        timestamp_values = [
+            compressor.latest_timestamps.get(key)
+            for key in (
+                "air_comp_running_flag",
+                "air_comp_loaded_flag",
+                "air_comp_supply_pressure",
+                "air_comp_discharge_temp",
+            )
+            if compressor.latest_timestamps.get(key) is not None
+        ]
+        item = {
+            "device_name": compressor.device_name,
+            "running": running_value >= 0.5 if running_value is not None else None,
+            "loaded": loaded_value >= 0.5 if loaded_value is not None else None,
+            "supply_pressure_mpa": pressure,
+            "discharge_temperature_c": temperature,
+            "linked_power_kw": power,
+            "active_alarm_count": len(compressor.alarms),
+            "data_timestamp": max(timestamp_values) if timestamp_values else None,
+        }
+        realtime[compressor.device_id] = item
+        state = "运行" if item["running"] else "停机" if item["running"] is False else "未知"
+        load_state = "加载" if item["loaded"] else "卸载" if item["loaded"] is False else "未知"
+        findings.append(f"{compressor.device_name} 当前状态：{state}/{load_state}")
+        if running_value is None:
+            missing.append(f"{compressor.device_name}:air_comp_running_flag")
+    metrics["realtime"] = realtime
+
+
+def _analyze_energy_consumption(
+    context: CompressorSystemContext,
+    metrics: dict[str, Any],
+    findings: list[str],
+    missing: list[str],
+) -> None:
+    meters = context.meters
+    if len(meters) != 1:
+        missing.append("空压系统需要唯一关联电表才能计算周期用电量")
+        return
+    meter = meters[0]
+    points = _points(meter, "meter_SupWh")
+    if len(points) < 2:
+        missing.append(f"{meter.device_name}:meter_SupWh 至少需要两个累计读数")
+        return
+    start_value = points[0].value
+    end_value = points[-1].value
+    if end_value < start_value:
+        missing.append(f"{meter.device_name}:meter_SupWh 周期内发生复位或倒退")
+        return
+    consumption = end_value - start_value
+    metrics["energy"] = {
+        "meter_name": meter.device_name,
+        "start_reading_kwh": round(start_value, 3),
+        "end_reading_kwh": round(end_value, 3),
+        "consumption_kwh": round(consumption, 3),
+        "calculation_method": "cumulative-register-delta",
+    }
+    findings.append(f"空压系统统计周期用电量 {consumption:.2f} kWh")
 
 
 def _analyze_pressure(
@@ -189,6 +435,7 @@ def _analyze_pressure(
     findings: list[str],
     warnings: list[dict[str, Any]],
     missing: list[str],
+    capabilities: list[str],
 ) -> None:
     pressure_metrics: dict[str, Any] = {}
     interval_ms = context.interval_seconds * 1000
@@ -228,10 +475,15 @@ def _analyze_pressure(
             "high_pressure_minutes": round(high_minutes, 2),
         }
         pressure_metrics[compressor.device_id] = result
-        findings.append(
-            f"{compressor.device_name}: 运行压力均值 {result['avg_mpa']:.3f} MPa，P95-P5 波动 {fluctuation:.3f} MPa"
-        )
-        if fluctuation >= settings.compressor_pressure_fluctuation_warning_mpa:
+        if "pressure_fluctuation" in capabilities:
+            findings.append(
+                f"{compressor.device_name}: 运行压力均值 {result['avg_mpa']:.3f} MPa，"
+                f"P95-P5 波动 {fluctuation:.3f} MPa"
+            )
+        if (
+            "pressure_fluctuation" in capabilities
+            and fluctuation >= settings.compressor_pressure_fluctuation_warning_mpa
+        ):
             warnings.append(
                 {
                     "severity": "medium",
@@ -242,7 +494,12 @@ def _analyze_pressure(
                     "evidence": result,
                 }
             )
-        if high_minutes > 0:
+        if "high_pressure" in capabilities:
+            findings.append(
+                f"{compressor.device_name}: 运行压力最大值 {result['max_mpa']:.3f} MPa，"
+                f"高于阈值累计约 {high_minutes:.2f} min"
+            )
+        if "high_pressure" in capabilities and high_minutes > 0:
             warnings.append(
                 {
                     "severity": "medium",
@@ -429,20 +686,74 @@ class CompressorAnalysisService:
         self.settings = settings or get_settings()
         self.context_builder = context_builder or CompressorContextBuilder(settings=self.settings)
 
-    def analyze(self, request: CompressorAnalysisRequest) -> CompressorAnalysisResult:
-        capabilities = infer_capabilities(request.message, request.capabilities)
-        request.capabilities = capabilities
+    def analyze_load_unload_rate(
+        self,
+        payload: LoadUnloadRateToolInput,
+    ) -> LoadUnloadRateToolResult:
+        request = CompressorAnalysisRequest(
+            message="分析单机加载率和卸载率",
+            device_scope=payload.device_scope,
+            start_at=payload.start_at,
+            end_at=payload.end_at,
+            interval_seconds=payload.interval_seconds,
+            capabilities=["load_rate"],
+        )
         context = self.context_builder.build(request)
+        return analyze_load_unload_rate_context(context, self.settings)
+
+    def analyze_capability(
+        self,
+        payload: LoadUnloadRateToolInput,
+        capability: CompressorCapability,
+        message: str,
+    ) -> CompressorAnalysisResult:
+        return self.analyze(
+            CompressorAnalysisRequest(
+                message=message,
+                device_scope=payload.device_scope,
+                start_at=payload.start_at,
+                end_at=payload.end_at,
+                interval_seconds=payload.interval_seconds,
+                capabilities=[capability],
+            )
+        )
+
+    def analyze_context(
+        self,
+        context: CompressorSystemContext,
+        capabilities: list[CompressorCapability],
+        query: str | None = None,
+    ) -> CompressorAnalysisResult:
         metrics: dict[str, Any] = {}
         findings: list[str] = []
         warnings: list[dict[str, Any]] = []
         missing: list[str] = []
         recommendations: list[dict[str, Any]] = []
 
+        if "realtime_status" in capabilities:
+            _analyze_realtime_status(context, metrics, findings, missing)
+        if "energy_consumption" in capabilities:
+            _analyze_energy_consumption(context, metrics, findings, missing)
         if any(capability in capabilities for capability in ("load_rate", "idle_running", "frequent_start")):
-            _analyze_operation(context, self.settings, metrics, findings, warnings, missing)
+            _analyze_operation(
+                context,
+                self.settings,
+                metrics,
+                findings,
+                warnings,
+                missing,
+                capabilities,
+            )
         if any(capability in capabilities for capability in ("pressure_fluctuation", "high_pressure")):
-            _analyze_pressure(context, self.settings, metrics, findings, warnings, missing)
+            _analyze_pressure(
+                context,
+                self.settings,
+                metrics,
+                findings,
+                warnings,
+                missing,
+                capabilities,
+            )
         if "specific_power" in capabilities:
             _analyze_specific_power(context, metrics, findings, missing)
         if "leakage" in capabilities:
@@ -470,6 +781,7 @@ class CompressorAnalysisService:
             "非生产时段按配置班次进行泄漏初筛，未扣除合法基础用气",
         ]
         return CompressorAnalysisResult(
+            query=query,
             data_status=data_status,
             capabilities=capabilities,
             context={
@@ -497,6 +809,101 @@ class CompressorAnalysisService:
             assumptions=assumptions,
             confidence=round(max(0, min(1, confidence)), 3),
         )
+
+    def analyze(self, request: CompressorAnalysisRequest) -> CompressorAnalysisResult:
+        capabilities = infer_capabilities(request.message, request.capabilities)
+        request.capabilities = capabilities
+        context = self.context_builder.build(request)
+        return self.analyze_context(context, capabilities, request.message)
+
+
+def merge_compressor_analysis_results(
+    results: list[CompressorAnalysisResult],
+    query: str,
+) -> CompressorAnalysisResult:
+    if not results:
+        return CompressorAnalysisResult(
+            query=query,
+            data_status="unavailable",
+            capabilities=[],
+            missing_metrics=["未取得任何空压机工具结果"],
+        )
+
+    capabilities = list(
+        dict.fromkeys(
+            capability
+            for result in results
+            for capability in result.capabilities
+        )
+    )
+    metrics: dict[str, Any] = {}
+    device_metrics: dict[str, dict[str, Any]] = {}
+    for result in results:
+        dumped_metrics = result.metrics.model_dump(mode="json", exclude_none=True)
+        for metric_name, metric_value in dumped_metrics.items():
+            if metric_name == "devices":
+                for device_id, device_value in metric_value.items():
+                    device_metrics.setdefault(device_id, {}).update(device_value)
+            else:
+                metrics[metric_name] = metric_value
+    if device_metrics:
+        metrics["devices"] = device_metrics
+
+    warnings_by_key = {}
+    for result in results:
+        for warning in result.warnings:
+            key = (
+                warning.code,
+                warning.device_id,
+                warning.message,
+            )
+            warnings_by_key[key] = warning
+    recommendations_by_key = {}
+    for result in results:
+        for recommendation in result.recommendations:
+            recommendations_by_key[recommendation.code] = recommendation
+
+    statuses = {result.data_status for result in results}
+    if statuses == {"no_scope"}:
+        data_status = "no_scope"
+    elif statuses <= {"unavailable"}:
+        data_status = "unavailable"
+    elif "partial" in statuses or "unavailable" in statuses:
+        data_status = "partial"
+    else:
+        data_status = "available"
+
+    return CompressorAnalysisResult(
+        query=query,
+        data_status=data_status,
+        capabilities=capabilities,
+        context=next((result.context for result in results if result.context is not None), None),
+        metrics=metrics,
+        findings=list(
+            dict.fromkeys(
+                finding
+                for result in results
+                for finding in result.findings
+            )
+        ),
+        warnings=list(warnings_by_key.values()),
+        missing_metrics=list(
+            dict.fromkeys(
+                metric
+                for result in results
+                for metric in result.missing_metrics
+            )
+        ),
+        recommendations=list(recommendations_by_key.values()),
+        assumptions=list(
+            dict.fromkeys(
+                assumption
+                for result in results
+                for assumption in result.assumptions
+            )
+        ),
+        confidence=min(result.confidence for result in results),
+    )
 
 
 def analyze_compressor_query(

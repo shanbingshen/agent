@@ -3,7 +3,8 @@ from datetime import UTC, datetime, timedelta
 from arthra.compressor.analysis import CompressorAnalysisService
 from arthra.compressor.capabilities import infer_capabilities
 from arthra.compressor.context import CompressorContextBuilder
-from arthra.compressor.schemas import CompressorAnalysisRequest
+from arthra.compressor.schemas import CompressorAnalysisRequest, LoadUnloadRateToolInput
+from arthra.compressor.tools import analyze_compressor_load_unload_rate_tool
 from arthra.config import Settings
 
 
@@ -65,6 +66,15 @@ class FakeCompressorRepository:
         return []
 
 
+class CounterFallbackRepository(FakeCompressorRepository):
+    def history(self, device_id, keys, start_ts, end_ts, interval_ms):
+        history = super().history(device_id, keys, start_ts, end_ts, interval_ms)
+        for key in ("air_comp_running_flag", "air_comp_loaded_flag"):
+            if key in history:
+                history[key] = []
+        return history
+
+
 def test_context_layer_links_meter_and_computes_core_capabilities():
     start = datetime(2026, 7, 16, tzinfo=UTC)
     settings = Settings(
@@ -94,9 +104,189 @@ def test_context_layer_links_meter_and_computes_core_capabilities():
     assert compressor["idle_running_minutes"] == 10.0
     assert compressor["longest_idle_running_minutes"] == 10.0
     assert compressor["start_count"] == 2
+    assert compressor["start_observation_hours"] == 0.917
+    assert compressor["starts_per_hour"] == 2.182
     assert result.metrics["specific_power"]["sample_pairs"] == 10
     assert result.context["data_quality"]["coverage"] == 1.0
 
 
+def test_idle_warning_uses_longest_continuous_period_not_cumulative_minutes():
+    start = datetime(2026, 7, 16, tzinfo=UTC)
+    settings = Settings(
+        llm_api_key="",
+        compressor_idle_warning_minutes=15,
+    )
+    service = CompressorAnalysisService(
+        context_builder=CompressorContextBuilder(
+            repository=FakeCompressorRepository(start), settings=settings
+        ),
+        settings=settings,
+    )
+
+    result = service.analyze(
+        CompressorAnalysisRequest(
+            message="idle running",
+            device_scope=["compressor-1"],
+            start_at=start,
+            end_at=start + timedelta(hours=1),
+            interval_seconds=300,
+            capabilities=["idle_running"],
+        )
+    )
+
+    assert result.metrics.devices["compressor-1"].idle_running_minutes == 10.0
+    assert result.metrics.devices["compressor-1"].longest_idle_running_minutes == 10.0
+    assert not any(
+        warning.code == "EXCESSIVE_CONTINUOUS_IDLE_RUNNING"
+        for warning in result.warnings
+    )
+
+
 def test_capability_inference_only_selects_requested_advanced_analysis():
     assert infer_capabilities("分析夜间泄漏和节能量") == ["leakage", "savings"]
+
+
+def test_load_unload_rate_tool_uses_aligned_state_samples():
+    start = datetime(2026, 7, 16, tzinfo=UTC)
+    settings = Settings(
+        llm_api_key="",
+        compressor_min_data_coverage=0.8,
+        compressor_unload_rate_warning_pct=20,
+    )
+    service = CompressorAnalysisService(
+        context_builder=CompressorContextBuilder(
+            repository=FakeCompressorRepository(start),
+            settings=settings,
+        ),
+        settings=settings,
+    )
+
+    result = service.analyze_load_unload_rate(
+        LoadUnloadRateToolInput(
+            device_scope=["compressor-1"],
+            start_at=start,
+            end_at=start + timedelta(hours=1),
+            interval_seconds=300,
+        )
+    )
+
+    assert result.capability == "load_rate"
+    assert result.data_status == "available"
+    assert len(result.devices) == 1
+    device = result.devices[0]
+    assert device.calculation_method == "aligned-state-ratio"
+    assert device.load_rate_pct == 80.0
+    assert device.unload_rate_pct == 20.0
+    assert device.running_minutes == 50.0
+    assert device.loaded_minutes == 40.0
+    assert device.unloaded_minutes == 10.0
+    assert device.sample_coverage == 1.0
+    assert device.exceeds_unload_warning_threshold is True
+    assert result.warnings[0].code == "HIGH_UNLOAD_RATE"
+
+
+def test_load_rate_only_does_not_report_unrelated_operation_data_as_missing():
+    start = datetime(2026, 7, 16, tzinfo=UTC)
+    settings = Settings(llm_api_key="")
+    service = CompressorAnalysisService(
+        context_builder=CompressorContextBuilder(
+            repository=FakeCompressorRepository(start),
+            settings=settings,
+        ),
+        settings=settings,
+    )
+
+    result = service.analyze(
+        CompressorAnalysisRequest(
+            message="只分析加载率和卸载率",
+            device_scope=["compressor-1"],
+            start_at=start,
+            end_at=start + timedelta(hours=1),
+            interval_seconds=300,
+            capabilities=["load_rate"],
+        )
+    )
+
+    assert result.capabilities == ["load_rate"]
+    assert not any("unloaded_running_flag" in item for item in result.missing_metrics)
+    assert not any("start_count" in item for item in result.missing_metrics)
+    assert result.metrics.devices["compressor-1"].load_unload_method == "aligned-state-ratio"
+
+
+def test_load_unload_rate_falls_back_to_cumulative_hour_deltas():
+    start = datetime(2026, 7, 16, tzinfo=UTC)
+    settings = Settings(llm_api_key="")
+    service = CompressorAnalysisService(
+        context_builder=CompressorContextBuilder(
+            repository=CounterFallbackRepository(start),
+            settings=settings,
+        ),
+        settings=settings,
+    )
+
+    result = service.analyze_load_unload_rate(
+        LoadUnloadRateToolInput(
+            device_scope=["compressor-1"],
+            start_at=start,
+            end_at=start + timedelta(hours=1),
+            interval_seconds=300,
+        )
+    )
+
+    device = result.devices[0]
+    assert result.data_status == "available"
+    assert device.calculation_method == "cumulative-hours-delta"
+    assert device.load_rate_pct == 72.73
+    assert device.unload_rate_pct == 27.27
+    assert device.running_minutes == 52.8
+    assert device.loaded_minutes == 38.4
+
+
+def test_load_unload_rate_tool_has_strict_json_schema():
+    schema = analyze_compressor_load_unload_rate_tool.args_schema.model_json_schema()
+
+    assert analyze_compressor_load_unload_rate_tool.name == "analyze_compressor_load_unload_rate"
+    assert schema["additionalProperties"] is False
+    assert "device_scope" in schema["required"]
+
+
+def test_pressure_tools_keep_fluctuation_and_high_pressure_conclusions_isolated():
+    start = datetime(2026, 7, 16, tzinfo=UTC)
+    settings = Settings(
+        llm_api_key="",
+        compressor_max_pressure_mpa=0.7,
+        compressor_pressure_fluctuation_warning_mpa=0.01,
+    )
+    service = CompressorAnalysisService(
+        context_builder=CompressorContextBuilder(
+            repository=FakeCompressorRepository(start),
+            settings=settings,
+        ),
+        settings=settings,
+    )
+    common = {
+        "device_scope": ["compressor-1"],
+        "start_at": start,
+        "end_at": start + timedelta(hours=1),
+        "interval_seconds": 300,
+    }
+
+    fluctuation = service.analyze(
+        CompressorAnalysisRequest(
+            message="只分析压力波动",
+            capabilities=["pressure_fluctuation"],
+            **common,
+        )
+    )
+    high_pressure = service.analyze(
+        CompressorAnalysisRequest(
+            message="只分析供气压力过高",
+            capabilities=["high_pressure"],
+            **common,
+        )
+    )
+
+    assert {warning.code for warning in fluctuation.warnings} == {"PRESSURE_FLUCTUATION"}
+    assert {warning.code for warning in high_pressure.warnings} == {"HIGH_SUPPLY_PRESSURE"}
+    assert fluctuation.capabilities == ["pressure_fluctuation"]
+    assert high_pressure.capabilities == ["high_pressure"]

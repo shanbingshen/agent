@@ -5,8 +5,9 @@ from langchain_core.tools import tool
 
 from arthra.agent_schemas import DeviceAnalysis, DeviceContext, ExpertAnalysis
 from arthra.contracts import AnalysisWarning, AttributeValues, TelemetryValues, TimestampValues
-from arthra.thingsboard import ThingsBoardClient, ThingsBoardError
-from arthra.thingsboard_schemas import DevicePage, TelemetryHistory
+from arthra.industrial_data import IndustrialDataError, IndustrialDataService
+from arthra.industrial_data.factory import get_industrial_data_service
+from arthra.industrial_data.schemas import IndustrialTelemetryHistory
 
 TelemetryLoader = Callable[[list[str]], list[DeviceContext]]
 
@@ -28,9 +29,9 @@ def _coerce_value(value: Any) -> Any:
 
 
 def flatten_latest_telemetry(
-    payload: TelemetryHistory | dict[str, Any],
+    payload: IndustrialTelemetryHistory | dict[str, Any],
 ) -> tuple[TelemetryValues, TimestampValues]:
-    history = TelemetryHistory.model_validate(payload)
+    history = IndustrialTelemetryHistory.model_validate(payload)
     values: dict[str, Any] = {}
     timestamps: dict[str, int] = {}
     for key, samples in history.items():
@@ -42,12 +43,15 @@ def flatten_latest_telemetry(
     return TelemetryValues.model_validate(values), TimestampValues.model_validate(timestamps)
 
 
-def load_device_context(device_ids: list[str]) -> list[DeviceContext]:
-    """Read device metadata and latest telemetry through the credential-isolated adapter."""
+def load_device_context(
+    device_ids: list[str],
+    service: IndustrialDataService | None = None,
+) -> list[DeviceContext]:
+    """Read metadata and telemetry through the unified industrial data service."""
     if not device_ids:
         return []
-    client = ThingsBoardClient()
-    page = DevicePage.model_validate(client.list_devices(page=0, page_size=1000))
+    data_service = service or get_industrial_data_service()
+    page = data_service.list_devices(page=0, page_size=1000)
     metadata = {item.id.id: item for item in page.data}
     contexts: list[DeviceContext] = []
     for device_id in dict.fromkeys(device_ids):
@@ -56,8 +60,10 @@ def load_device_context(device_ids: list[str]) -> list[DeviceContext]:
             contexts.append(DeviceContext(id=device_id, error="设备不存在或当前账号无权访问"))
             continue
         try:
-            telemetry, timestamps = flatten_latest_telemetry(client.latest_telemetry(device_id))
-            attributes = client.attributes(device_id)
+            telemetry, timestamps = flatten_latest_telemetry(
+                data_service.latest_telemetry(device_id)
+            )
+            attributes = data_service.attributes(device_id)
             contexts.append(DeviceContext(
                 id=device_id,
                 name=device.name,
@@ -66,7 +72,7 @@ def load_device_context(device_ids: list[str]) -> list[DeviceContext]:
                 timestamps=timestamps,
                 attributes=AttributeValues.model_validate(attributes),
             ))
-        except ThingsBoardError as exc:
+        except IndustrialDataError as exc:
             contexts.append(DeviceContext(
                 id=device_id,
                 name=device.name,
@@ -78,7 +84,7 @@ def load_device_context(device_ids: list[str]) -> list[DeviceContext]:
 
 @tool("get_latest_device_telemetry")
 def get_latest_device_telemetry(device_ids: list[str]) -> list[DeviceContext]:
-    """Return metadata and latest ThingsBoard telemetry for approved device IDs."""
+    """Return metadata and telemetry through the configured industrial data provider."""
     return load_device_context(device_ids)
 
 
@@ -110,6 +116,7 @@ def _analyze_compressor(device: DeviceContext) -> tuple[list[str], list[str], li
     )
     current = _number(telemetry, "air_comp_main_current_a")
     power = None if uses_point_table else _number(telemetry, "power_kw")
+    linked_meter_id = device.attributes.get("linkedMeterDeviceId")
     running_state = telemetry.get("air_comp_running_state")
     running = telemetry.get("running") if running_state is None else running_state == "running"
     if pressure_mpa is None:
@@ -131,6 +138,8 @@ def _analyze_compressor(device: DeviceContext) -> tuple[list[str], list[str], li
         missing.append("air_comp_main_current_a")
     if power is not None:
         findings.append(f"实时功率 {power:.2f} kW")
+    elif linked_meter_id:
+        findings.append(f"功率由关联电表 {linked_meter_id} 独立计量")
     else:
         missing.append("关联电表 meter_TotW（空压机点表未提供有功功率）")
     if temperature is None:
@@ -188,10 +197,13 @@ def _analyze_compressor(device: DeviceContext) -> tuple[list[str], list[str], li
             warnings.append(
                 {"severity": "medium", "metric": key, "value": True, "message": name}
             )
-    if "flow_m3_min" not in telemetry:
+    flow = _first_number(telemetry, "air_comp_fad_flow_m3_min", "flow_m3_min")
+    if flow is None:
         missing.append(
-            "产气流量 flow_m3_min（计算比功率 kW/(m³/min) 所需，当前点表未提供）"
+            "产气流量 air_comp_fad_flow_m3_min（计算比功率 kW/(m³/min) 所需）"
         )
+    else:
+        findings.append(f"实时产气流量 {flow:.3f} m³/min")
     return findings, missing, warnings
 
 
@@ -244,7 +256,15 @@ def _analyze_power(device: DeviceContext) -> tuple[list[str], list[str], list[di
     if current_imbalance is not None:
         findings.append(f"电流不平衡度 {current_imbalance:.3f}%")
         if current_imbalance > 10:
-            warnings.append({"severity": "medium", "metric": "meter_ImbNgA", "value": current_imbalance, "message": "电流不平衡度超过 10% 演示阈值"})
+            warnings.append({
+                "severity": "medium",
+                "metric": "meter_ImbNgA",
+                "value": current_imbalance,
+                "message": (
+                    "电流不平衡度触发平台内部预警阈值，属于疑似异常；"
+                    "需核查缺相、CT接线与倍率、点位映射和采样同步后确认"
+                ),
+            })
     voltage_thd = [
         value
         for key in ("meter_ThdPhV_phsA", "meter_ThdPhV_phsB", "meter_ThdPhV_phsC")
@@ -258,17 +278,14 @@ def _analyze_power(device: DeviceContext) -> tuple[list[str], list[str], list[di
     if voltage_thd:
         findings.append(f"最大电压 THD {max(voltage_thd):.3f}%")
         if max(voltage_thd) > 5:
-            warnings.append({"severity": "high", "metric": "meter_ThdPhV", "value": max(voltage_thd), "message": "电压总谐波畸变率超过 5% 演示阈值"})
+            warnings.append({"severity": "high", "metric": "meter_ThdPhV", "value": max(voltage_thd), "message": "电压THD触发平台内部预警阈值；是否构成标准超限需结合测点和适用判据确认"})
     if current_thd:
         findings.append(f"最大电流 THD {max(current_thd):.3f}%")
         if max(current_thd) > 15:
-            warnings.append({"severity": "medium", "metric": "meter_ThdA", "value": max(current_thd), "message": "电流总谐波畸变率超过 15% 演示阈值"})
+            warnings.append({"severity": "medium", "metric": "meter_ThdA", "value": max(current_thd), "message": "电流THD触发平台内部预警阈值；是否构成标准超限需结合PCC测点、短路容量和负荷电流确认"})
     energy = _number(telemetry, "meter_SupWh")
-    demand = _number(telemetry, "meter_MaxDmdSupW")
     if energy is not None:
         findings.append(f"正向有功总电能 {energy:.2f} kWh")
-    if demand is not None:
-        findings.append(f"正向有功最大需量 {demand:.3f} kW")
     return findings, missing, warnings
 
 

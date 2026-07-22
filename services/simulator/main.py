@@ -36,7 +36,7 @@ TB_PASSWORD = os.getenv("THINGSBOARD_PASSWORD", "tenant")
 MQTT_HOST = os.getenv("THINGSBOARD_MQTT_HOST", "thingsboard")
 SIMULATION_EPOCH_SECONDS = 1_767_225_600  # 2026-01-01T00:00:00Z
 HISTORY_INTERVAL_SECONDS = 60
-HISTORY_WINDOW_HOURS = 24
+HISTORY_WINDOW_HOURS = 72
 COMPRESSOR_CONTEXT_KEYS = {
     "air_comp_running_flag",
     "air_comp_loaded_flag",
@@ -45,11 +45,42 @@ COMPRESSOR_CONTEXT_KEYS = {
     "air_comp_loading_hours",
     "air_comp_start_count",
     "air_comp_supply_pressure",
+    "air_comp_discharge_temp",
     "air_system_header_pressure_mpa",
     "air_comp_main_current_a",
     "air_comp_fad_flow_m3_min",
 }
-METER_CONTEXT_KEYS = {"meter_TotW", "meter_SupWh"}
+METER_CONTEXT_KEYS = {
+    "meter_TotW",
+    "meter_SupWh",
+    "meter_LinV_phsAB",
+    "meter_LinV_phsBC",
+    "meter_LinV_phsCA",
+    "meter_ImbNgV",
+    "meter_ImbNgA",
+    "meter_A_phsA",
+    "meter_A_phsB",
+    "meter_A_phsC",
+    "meter_TotPF",
+    "meter_ThdPhV_phsA",
+    "meter_ThdPhV_phsB",
+    "meter_ThdPhV_phsC",
+    "meter_ThdA_phsA",
+    "meter_ThdA_phsB",
+    "meter_ThdA_phsC",
+    *{
+        f"meter_{prefix}{order}_phs{phase}"
+        for prefix in ("ThdPhV", "ThdA")
+        for order in (3, 5, 7)
+        for phase in ("A", "B", "C")
+    },
+}
+EMS_CONTEXT_KEYS = {"power_kw", "energy_kwh", "soc"}
+CONTEXT_KEYS_BY_TYPE = {
+    "ems": EMS_CONTEXT_KEYS,
+    "meter": METER_CONTEXT_KEYS,
+    "compressor": COMPRESSOR_CONTEXT_KEYS,
+}
 
 
 def simulation_tick(timestamp: float | None = None) -> int:
@@ -107,22 +138,57 @@ def ensure_devices(client: httpx.Client, jwt_token: str) -> None:
             ).raise_for_status()
 
 
-def seed_context_history(client: httpx.Client) -> None:
+def _history_seed_required(
+    client: httpx.Client,
+    jwt_token: str,
+    device: SimulatorDevice,
+    now: float,
+) -> bool:
+    keys = CONTEXT_KEYS_BY_TYPE[device.device_type]
+    response = client.get(
+        f"/api/plugins/telemetry/DEVICE/{device.entity_id}/values/timeseries",
+        headers={"X-Authorization": f"Bearer {jwt_token}"},
+        params={
+            "keys": ",".join(sorted(keys)),
+            "startTs": int((now - HISTORY_WINDOW_HOURS * 3600) * 1000),
+            "endTs": int(now * 1000),
+            "limit": 1,
+            "orderBy": "ASC",
+        },
+    )
+    response.raise_for_status()
+    payload = response.json()
+    oldest_allowed_ts = int((now - (HISTORY_WINDOW_HOURS - 1) * 3600) * 1000)
+    return any(
+        not payload.get(key)
+        or int(payload[key][0]["ts"]) > oldest_allowed_ts
+        for key in keys
+    )
+
+
+def _historical_telemetry(device: SimulatorDevice, tick: int) -> TelemetryPayload:
+    if device.device_type == "ems":
+        raw = ems_telemetry(tick)
+    elif device.device_type == "meter":
+        raw = meter_telemetry(tick)
+    else:
+        raw = compressor_telemetry(tick)
+    return TelemetryPayload.model_validate(raw)
+
+
+def seed_context_history(client: httpx.Client, jwt_token: str) -> None:
     now = time.time()
     sample_count = HISTORY_WINDOW_HOURS * 3600 // HISTORY_INTERVAL_SECONDS
     for device in DEVICES:
-        if device.device_type not in {"compressor", "meter"}:
+        if not _history_seed_required(client, jwt_token, device, now):
+            print(f"Recent history exists for {device.name}; skipping seed", flush=True)
             continue
         rows = []
         for index in range(sample_count, 0, -1):
             timestamp = now - index * HISTORY_INTERVAL_SECONDS
             tick = simulation_tick(timestamp)
-            values = telemetry(device, tick)
-            allowed = (
-                COMPRESSOR_CONTEXT_KEYS
-                if device.device_type == "compressor"
-                else METER_CONTEXT_KEYS
-            )
+            values = _historical_telemetry(device, tick)
+            allowed = CONTEXT_KEYS_BY_TYPE[device.device_type]
             rows.append(HistoryRow(
                 ts=int(timestamp * 1000),
                 values=TelemetryPayload({
@@ -174,7 +240,7 @@ def main() -> None:
     with httpx.Client(base_url=TB_URL, timeout=20) as client:
         token = wait_for_token(client)
         ensure_devices(client, token)
-        seed_context_history(client)
+        seed_context_history(client, token)
         listeners = [start_rpc_listener(device) for device in DEVICES]
         tick = simulation_tick()
         while True:

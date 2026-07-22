@@ -31,10 +31,43 @@ class UserCreate(StrictModel):
     role: Role = Role.analyst
 
 
+class ChatPageContext(StrictModel):
+    factory_id: str | None = Field(default=None, max_length=128)
+    selected_device_ids: list[str] = Field(default_factory=list, max_length=100)
+
+
 class ChatRequest(StrictModel):
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
     thread_id: str = Field(min_length=1, max_length=128)
     message: str = Field(min_length=1, max_length=10_000)
     device_scope: list[str] = Field(default_factory=list)
+    page_context: ChatPageContext | None = None
+    debug: bool = False
+
+    @property
+    def effective_device_scope(self) -> list[str]:
+        contextual = self.page_context.selected_device_ids if self.page_context else []
+        return list(dict.fromkeys([*self.device_scope, *contextual]))
+
+
+class CustomerWarningView(StrictModel):
+    severity: str
+    message: str
+    device_name: str | None = None
+
+
+class CustomerAnalysisView(StrictModel):
+    expert: str
+    title: str
+    data_status: str
+    findings: list[str] = Field(default_factory=list)
+    warnings: list[CustomerWarningView] = Field(default_factory=list)
+    data_quality: Literal["高", "中", "低", "未知"] = "未知"
+    confidence: Literal["高", "中高", "中", "低", "未知"] = "未知"
+
+
+class NodeProgressView(StrictModel):
+    status: Literal["completed"] = "completed"
 
 
 class DailySummaryCreate(StrictModel):
@@ -173,3 +206,4 @@ class AuditEventRead(OrmReadModel):
 class HealthResponse(StrictModel):
     status: Literal["ok"] = "ok"
     time: datetime
+    industrial_data_provider: Literal["thingsboard", "mock", "timeseries_api"]

@@ -3,15 +3,12 @@ from arthra.contracts import AttributeValues, TelemetryValues, TimestampValues
 from arthra.industrial_data import IndustrialDataError, IndustrialDataService
 from arthra.industrial_data.factory import get_industrial_data_service
 from arthra.industrial_data.schemas import (
-    IndustrialAlarm,
     IndustrialDeviceCatalogItem,
     IndustrialTelemetryHistory,
 )
 
-SUPPORTED_CONTEXT_DEVICE_TYPES = {"compressor", "meter"}
 
-
-class CompressorRepository:
+class PowerRepository:
     """Domain repository backed by the source-neutral industrial data service."""
 
     def __init__(self, service: IndustrialDataService | None = None):
@@ -19,16 +16,16 @@ class CompressorRepository:
 
     def catalog(self) -> list[IndustrialDeviceCatalogItem]:
         page = self.service.list_devices(page=0, page_size=1000)
-        catalog: list[IndustrialDeviceCatalogItem] = []
+        meters: list[IndustrialDeviceCatalogItem] = []
         for device in page.data:
-            if device.type not in SUPPORTED_CONTEXT_DEVICE_TYPES:
+            if device.type != "meter":
                 continue
             device_id = device.id.id
             try:
                 attributes = self.service.attributes(device_id)
             except IndustrialDataError:
                 attributes = AttributeValues({})
-            catalog.append(
+            meters.append(
                 IndustrialDeviceCatalogItem(
                     device_id=device_id,
                     device_name=device.name,
@@ -36,7 +33,7 @@ class CompressorRepository:
                     attributes=attributes,
                 )
             )
-        return catalog
+        return meters
 
     def latest(
         self,
@@ -67,6 +64,3 @@ class CompressorRepository:
             agg="AVG",
             interval=interval_ms,
         )
-
-    def alarms(self, device_id: str) -> list[IndustrialAlarm]:
-        return self.service.list_alarms(device_id).data
