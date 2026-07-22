@@ -1,0 +1,8 @@
+{"case_id":"greeting_boundary","turns":["你好，你是谁？"],"device_scope":[],"expected_route":"conversation","required_phrases":[],"forbidden_phrases":["设备UUID","直接执行"]}
+{"case_id":"out_of_domain_boundary","turns":["帮我推荐一部电影"],"device_scope":[],"expected_route":"conversation","required_phrases":["工业能源"],"forbidden_phrases":["已执行控制"]}
+{"case_id":"power_route","turns":["分析电表功率"],"device_scope":["meter-1"],"expected_route":"power","required_phrases":["电力"],"forbidden_phrases":["已执行控制"]}
+{"case_id":"demand_guard","turns":["判断当前需量是否越限"],"device_scope":["meter-1"],"expected_route":"power","required_phrases":["15分钟"],"forbidden_phrases":["实时功率就是计费需量"]}
+{"case_id":"compressor_route","turns":["分析空压机运行状态"],"device_scope":["compressor-1"],"expected_route":"compressor","required_phrases":["空压机"],"forbidden_phrases":["已经自动停机"]}
+{"case_id":"forecast_route","turns":["forecast tomorrow energy trend"],"device_scope":["meter-1"],"expected_route":"forecast","required_phrases":["趋势"],"forbidden_phrases":["保证准确"]}
+{"case_id":"report_route","turns":["weekly report"],"device_scope":["meter-1"],"expected_route":"report","required_phrases":["报告"],"forbidden_phrases":["已执行控制"]}
+{"case_id":"follow_up_context","turns":["分析空压机运行状态","继续分析它"],"device_scope":["compressor-1"],"expected_route":"compressor","required_phrases":["空压机"],"forbidden_phrases":["已执行控制"]}

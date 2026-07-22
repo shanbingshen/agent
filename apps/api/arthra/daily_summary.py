@@ -3,6 +3,7 @@ import json
 import logging
 import uuid
 from datetime import UTC, datetime, time, timedelta
+from time import perf_counter
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,7 @@ from arthra.agent_schemas import DeviceContext
 from arthra.agent_tools import analyze_device_context, flatten_latest_telemetry
 from arthra.config import Settings, get_settings
 from arthra.contracts import AnalysisWarning, AttributeValues, JsonObject
+from arthra.daily_insight import run_daily_insight_graph
 from arthra.daily_schemas import (
     DailyAlarm,
     DailyDeviceStatistics,
@@ -30,7 +32,13 @@ from arthra.industrial_data.schemas import (
     IndustrialDevicePage,
     IndustrialTelemetryHistory,
 )
-from arthra.models import AuditEvent, DailySummary
+from arthra.models import (
+    DEFAULT_FACTORY_ID,
+    DEFAULT_TENANT_ID,
+    AuditEvent,
+    DailySummary,
+)
+from arthra.observability import METRICS, persist_agent_trace
 
 SUPPORTED_DEVICE_TYPES = {"ems", "meter", "compressor"}
 logger = logging.getLogger(__name__)
@@ -386,7 +394,10 @@ def generate_daily_summary(
     now: datetime | None = None,
     client: IndustrialDataAdapter | IndustrialDataService | None = None,
     settings: Settings | None = None,
+    tenant_id: uuid.UUID = DEFAULT_TENANT_ID,
+    factory_id: uuid.UUID = DEFAULT_FACTORY_ID,
 ) -> DailySummary:
+    started = perf_counter()
     settings = settings or get_settings()
     period_end = now or datetime.now(UTC)
     if period_end.tzinfo is None:
@@ -400,18 +411,20 @@ def generate_daily_summary(
         period_start,
         period_end,
     )
-    status = "deterministic"
-    model_name = "deterministic-fallback"
-    content = deterministic_summary(title, snapshot)
-    if settings.llm_api_key:
-        try:
-            content = _synthesize_with_llm(title, snapshot, settings)
-            status = "generated"
-            model_name = settings.llm_model
-        except Exception:
-            status = "fallback"
+    insight = run_daily_insight_graph(
+        title,
+        snapshot,
+        settings,
+        renderer=deterministic_summary,
+        narrator=_synthesize_with_llm,
+    )
+    status = insight.generation_status
+    model_name = insight.model_name
+    content = insight.content
 
     summary = DailySummary(
+        tenant_id=tenant_id,
+        factory_id=factory_id,
         summary_date=local_date,
         period_start=period_start,
         period_end=period_end,
@@ -420,6 +433,7 @@ def generate_daily_summary(
         device_scope=[device.device_id for device in snapshot.devices],
         statistics=snapshot.model_dump(mode="json"),
         warnings=[warning.model_dump(mode="json") for warning in snapshot.warnings],
+        insight_payload=insight.model_dump(mode="json"),
         model_name=model_name,
         status=status,
         trigger=trigger,
@@ -429,6 +443,8 @@ def generate_daily_summary(
     db.flush()
     db.add(
         AuditEvent(
+            tenant_id=tenant_id,
+            factory_id=factory_id,
             actor_id=generated_by,
             action="daily_summary.generated",
             resource_type="daily_summary",
@@ -441,6 +457,26 @@ def generate_daily_summary(
                 }
             ).model_dump(mode="json"),
         )
+    )
+    duration_ms = (perf_counter() - started) * 1000
+    METRICS.increment(
+        "daily_insight_runs_total",
+        labels={"status": status},
+    )
+    METRICS.observe("daily_insight_duration_ms", duration_ms)
+    persist_agent_trace(
+        db,
+        trace_id=uuid.uuid4().hex,
+        request_id=str(summary.id),
+        tenant_id=tenant_id,
+        factory_id=factory_id,
+        user_id=generated_by,
+        thread_id=None,
+        operation="daily_insight",
+        status=status,
+        duration_ms=duration_ms,
+        route="daily_insight",
+        tool_names=[f"daily_{expert}_expert" for expert in insight.experts],
     )
     db.commit()
     db.refresh(summary)
@@ -455,6 +491,8 @@ def ensure_scheduled_summary() -> DailySummary | None:
     with SessionLocal() as db:
         existing = db.scalar(
             select(DailySummary).where(
+                DailySummary.tenant_id == DEFAULT_TENANT_ID,
+                DailySummary.factory_id == DEFAULT_FACTORY_ID,
                 DailySummary.summary_date == local_now.date(),
                 DailySummary.trigger == "scheduled",
             )
@@ -468,6 +506,8 @@ def ensure_scheduled_summary() -> DailySummary | None:
             trigger="scheduled",
             now=local_now.astimezone(UTC),
             settings=settings,
+            tenant_id=DEFAULT_TENANT_ID,
+            factory_id=DEFAULT_FACTORY_ID,
         )
 
 

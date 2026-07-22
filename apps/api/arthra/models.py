@@ -3,7 +3,18 @@ from datetime import UTC, date, datetime
 from enum import StrEnum
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import JSON, Date, DateTime, Enum, ForeignKey, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from arthra.contracts import JsonValue
@@ -12,6 +23,10 @@ from arthra.db import Base
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+DEFAULT_FACTORY_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
 
 class Role(StrEnum):
@@ -35,10 +50,35 @@ class RiskLevel(StrEnum):
     high = "high"
 
 
+class Tenant(Base):
+    __tablename__ = "tenants"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    slug: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Factory(Base):
+    __tablename__ = "factories"
+    __table_args__ = (UniqueConstraint("tenant_id", "code", name="uq_factory_tenant_code"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), index=True)
+    code: Mapped[str] = mapped_column(String(100))
+    name: Mapped[str] = mapped_column(String(255))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class User(Base):
     __tablename__ = "users"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tenants.id"), index=True, default=DEFAULT_TENANT_ID
+    )
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(512))
     role: Mapped[Role] = mapped_column(Enum(Role), default=Role.analyst)
@@ -46,10 +86,74 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class UserFactoryAccess(Base):
+    __tablename__ = "user_factory_access"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    factory_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("factories.id", ondelete="CASCADE"), primary_key=True)
+    can_manage_devices: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class FactoryDevice(Base):
+    __tablename__ = "factory_devices"
+
+    device_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    factory_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("factories.id", ondelete="CASCADE"), index=True)
+    device_name: Mapped[str] = mapped_column(String(255))
+    device_type: Mapped[str] = mapped_column(String(64))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentThread(Base):
+    __tablename__ = "agent_threads"
+    __table_args__ = (
+        UniqueConstraint("checkpoint_ns", "client_thread_id", name="uq_agent_thread_client"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), index=True)
+    factory_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("factories.id"), index=True)
+    owner_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    checkpoint_ns: Mapped[str] = mapped_column(String(128))
+    client_thread_id: Mapped[str] = mapped_column(String(128))
+    checkpoint_thread_id: Mapped[str] = mapped_column(String(255), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentTrace(Base):
+    __tablename__ = "agent_traces"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    trace_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    request_id: Mapped[str] = mapped_column(String(128), index=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"), index=True)
+    factory_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("factories.id"), index=True)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    operation: Mapped[str] = mapped_column(String(64), index=True)
+    route: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    intent: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    duration_ms: Mapped[float] = mapped_column(Float, default=0)
+    node_timings: Mapped[dict[str, JsonValue]] = mapped_column(JSON, default=dict)
+    tool_names: Mapped[list[str]] = mapped_column(JSON, default=list)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ControlPlan(Base):
     __tablename__ = "control_plans"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tenants.id"), index=True, default=DEFAULT_TENANT_ID
+    )
+    factory_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("factories.id"), index=True, default=DEFAULT_FACTORY_ID
+    )
     device_id: Mapped[str] = mapped_column(String(64), index=True)
     device_name: Mapped[str] = mapped_column(String(255))
     device_type: Mapped[str] = mapped_column(String(64))
@@ -71,6 +175,12 @@ class AuditEvent(Base):
     __tablename__ = "audit_events"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tenants.id"), index=True, default=DEFAULT_TENANT_ID
+    )
+    factory_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("factories.id"), nullable=True, index=True
+    )
     actor_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     action: Mapped[str] = mapped_column(String(100), index=True)
     resource_type: Mapped[str] = mapped_column(String(100))
@@ -83,6 +193,12 @@ class DailySummary(Base):
     __tablename__ = "daily_summaries"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tenants.id"), index=True, default=DEFAULT_TENANT_ID
+    )
+    factory_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("factories.id"), index=True, default=DEFAULT_FACTORY_ID
+    )
     summary_date: Mapped[date] = mapped_column(Date, index=True)
     period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -91,6 +207,7 @@ class DailySummary(Base):
     device_scope: Mapped[list[str]] = mapped_column(JSON, default=list)
     statistics: Mapped[dict[str, JsonValue]] = mapped_column(JSON, default=dict)
     warnings: Mapped[list[dict[str, JsonValue]]] = mapped_column(JSON, default=list)
+    insight_payload: Mapped[dict[str, JsonValue]] = mapped_column(JSON, default=dict)
     model_name: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="generated")
     trigger: Mapped[str] = mapped_column(String(32), default="manual")
@@ -104,6 +221,12 @@ class KnowledgeDocument(Base):
     __tablename__ = "knowledge_documents"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tenants.id"), index=True, default=DEFAULT_TENANT_ID
+    )
+    factory_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("factories.id"), index=True, default=DEFAULT_FACTORY_ID
+    )
     filename: Mapped[str] = mapped_column(String(255))
     media_type: Mapped[str] = mapped_column(String(100))
     status: Mapped[str] = mapped_column(String(32), default="ready")

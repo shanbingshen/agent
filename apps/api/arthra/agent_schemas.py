@@ -12,6 +12,19 @@ from arthra.contracts import (
 
 type ExpertName = Literal["ems", "power", "compressor", "forecast", "report"]
 type DataStatus = Literal["no_scope", "available", "partial", "unavailable"]
+type ExpertSupplementStatus = Literal[
+    "provided",
+    "empty",
+    "unavailable",
+    "not_configured",
+    "not_applicable",
+]
+
+
+class ModelSynthesisResult(StrictModel):
+    response: str
+    supplement: str = ""
+    supplement_status: ExpertSupplementStatus = "not_applicable"
 
 
 class DeviceContext(StrictModel):
@@ -41,4 +54,3 @@ class ExpertAnalysis(StrictModel):
     findings: list[str] = Field(default_factory=list)
     missing_metrics: list[str] = Field(default_factory=list)
     warnings: list[AnalysisWarning] = Field(default_factory=list)
-
