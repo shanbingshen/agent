@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     supervisor_semantic_routing_enabled: bool = True
     supervisor_llm_model: str = ""
     supervisor_route_confidence_threshold: float = Field(default=0.65, ge=0, le=1)
+    compressor_expert_llm_enabled: bool = True
+    compressor_expert_llm_model: str = ""
+    power_expert_llm_enabled: bool = True
+    power_expert_llm_model: str = ""
     embedding_api_key: str = ""
     embedding_base_url: str = "https://api.openai.com/v1"
     embedding_model: str = "text-embedding-3-small"
@@ -37,6 +41,12 @@ class Settings(BaseSettings):
     thingsboard_username: str = "tenant@thingsboard.org"
     thingsboard_password: str = "tenant"
     thingsboard_request_timeout: float = 15
+
+    industrial_data_provider: Literal["thingsboard", "mock", "timeseries_api"] = "thingsboard"
+    industrial_data_mock_file: str = ""
+    timeseries_api_url: str = ""
+    timeseries_api_token: str = ""
+    timeseries_api_timeout: float = Field(default=15, gt=0, le=120)
 
     daily_summary_enabled: bool = True
     daily_summary_hour: int = Field(default=8, ge=0, le=23)
@@ -55,6 +65,18 @@ class Settings(BaseSettings):
     compressor_production_start_hour: int = Field(default=8, ge=0, le=23)
     compressor_production_end_hour: int = Field(default=18, ge=0, le=23)
     compressor_unload_savings_factor: float = Field(default=0.5, ge=0, le=1)
+
+    power_analysis_window_hours: int = Field(default=24, ge=1, le=744)
+    power_history_interval_seconds: int = Field(default=60, ge=30, le=900)
+    power_min_data_coverage: float = Field(default=0.8, ge=0, le=1)
+    power_declared_demand_kw: float = Field(default=100, gt=0)
+    power_nominal_voltage_v: float = Field(default=380, gt=0)
+    power_voltage_deviation_pct: float = Field(default=5, gt=0)
+    power_voltage_unbalance_pct: float = Field(default=2, gt=0)
+    power_current_unbalance_pct: float = Field(default=10, gt=0)
+    power_factor_min: float = Field(default=0.9, ge=0, le=1)
+    power_thdu_max_pct: float = Field(default=5, gt=0)
+    power_thdi_max_pct: float = Field(default=15, gt=0)
 
     control_plan_ttl_seconds: int = 600
     control_allowed_methods: Annotated[list[str], NoDecode] = Field(

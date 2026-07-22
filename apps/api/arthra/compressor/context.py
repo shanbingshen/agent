@@ -13,7 +13,10 @@ from arthra.compressor.schemas import (
     SignalSeries,
 )
 from arthra.config import Settings, get_settings
-from arthra.thingsboard_schemas import DeviceCatalogItem, TelemetrySample
+from arthra.industrial_data.schemas import (
+    IndustrialDeviceCatalogItem,
+    IndustrialTelemetrySample,
+)
 
 
 class CompressorContextError(RuntimeError):
@@ -30,10 +33,10 @@ def _number(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _series(key: str, raw_samples: list[TelemetrySample]) -> SignalSeries:
+def _series(key: str, raw_samples: list[IndustrialTelemetrySample]) -> SignalSeries:
     points: list[SignalPoint] = []
     for raw_sample in raw_samples or []:
-        sample = TelemetrySample.model_validate(raw_sample)
+        sample = IndustrialTelemetrySample.model_validate(raw_sample)
         value = _number(sample.value)
         if value is None:
             continue
@@ -63,9 +66,9 @@ class CompressorContextBuilder:
 
     def _select_catalog(
         self,
-        catalog: list[DeviceCatalogItem],
+        catalog: list[IndustrialDeviceCatalogItem],
         request: CompressorAnalysisRequest,
-    ) -> tuple[str, list[DeviceCatalogItem]]:
+    ) -> tuple[str, list[IndustrialDeviceCatalogItem]]:
         requested_ids = set(request.device_scope)
         requested = [item for item in catalog if item["device_id"] in requested_ids]
         if request.device_scope and not any(item["device_type"] == "compressor" for item in requested):

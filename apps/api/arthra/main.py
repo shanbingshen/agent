@@ -6,13 +6,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-from arthra.agent import AgentState, RouteDecision, build_graph
+from arthra.agent import (
+    AgentState,
+    CompressorToolCallPlan,
+    PowerToolCallPlan,
+    RouteDecision,
+    build_graph,
+)
 from arthra.agent_schemas import ExpertAnalysis
 from arthra.api import router
-from arthra.compressor.schemas import CompressorAnalysisResult
+from arthra.compressor.schemas import CompressorAnalysisResult, CompressorSystemContext
 from arthra.config import get_settings
+from arthra.contracts import AnalysisWarning
 from arthra.daily_summary import daily_summary_scheduler
 from arthra.db import SessionLocal
+from arthra.power.schemas import PowerAnalysisResult, PowerSystemContext
 from arthra.security import bootstrap_admin
 
 
@@ -27,9 +35,15 @@ async def lifespan(app: FastAPI):
         checkpointer.serde = JsonPlusSerializer(
             allowed_msgpack_modules=(
                 AgentState,
+                CompressorToolCallPlan,
+                PowerToolCallPlan,
                 RouteDecision,
                 ExpertAnalysis,
                 CompressorAnalysisResult,
+                CompressorSystemContext,
+                PowerAnalysisResult,
+                PowerSystemContext,
+                AnalysisWarning,
             )
         )
         checkpointer.setup()

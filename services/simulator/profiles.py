@@ -53,6 +53,7 @@ def meter_attributes() -> dict[str, JsonValue]:
         "meter_WiringMode": "3P4L",
         "dev_InstallLocation": "低压配电室进线柜",
         "pointTableVersion": "ADL400 V3.1",
+        "declaredDemandKw": 100.0,
     }
 
 

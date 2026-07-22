@@ -1,139 +1,778 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
-import { API_BASE, api, type ControlPlan, type DailySummary, type Device, type User } from "./api";
+import { FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import {
+  api,
+  type ChatStreamEvent,
+  type CompressorAnalysisResult,
+  type DailySummary,
+  type Device,
+  type PowerAnalysisResult,
+  streamChat,
+  type TelemetryPayload,
+  type User,
+} from "./api";
 
-type View = "dashboard" | "daily" | "chat" | "knowledge" | "approvals" | "audit";
-const views: Array<[View, string, string]> = [
-  ["dashboard", "总览", "◫"], ["daily", "每日摘要", "☀"], ["chat", "AI 分析", "✦"], ["knowledge", "知识库", "◇"],
-  ["approvals", "控制审批", "✓"], ["audit", "审计记录", "≡"],
+type Workspace = "overview" | "demand" | "quality" | "compressor" | "carbon" | "events";
+type Alarm = { type: string; severity: string; status: string; created_time: number };
+type DeviceSnapshot = { device: Device; telemetry: TelemetryPayload; history: TelemetryPayload; alarms: Alarm[] };
+type AssistantMessage = { id: string; who: "ai" | "you"; text: string; errorCode?: string; stopped?: boolean };
+type InsightTone = "cyan" | "amber" | "green" | "muted";
+type InsightMetric = { label: string; value: string; tone?: InsightTone };
+type InsightEvidence = { label: string; value: string };
+type PageInsight = {
+  id: string;
+  icon: string;
+  tone: InsightTone;
+  title: string;
+  summary: string;
+  badge: string;
+  detailTitle: string;
+  detailSummary: string;
+  metrics: InsightMetric[];
+  evidence: InsightEvidence[];
+  prompt: string;
+};
+
+const navItems: Array<{ id: Workspace; label: string; icon: string }> = [
+  { id: "overview", label: "首页", icon: "⌂" },
+  { id: "demand", label: "需量管理", icon: "▣" },
+  { id: "quality", label: "电能质量", icon: "∿" },
+  { id: "compressor", label: "空压系统", icon: "▦" },
+  { id: "carbon", label: "碳减排", icon: "◒" },
+  { id: "events", label: "智能事件", icon: "◎" },
 ];
+
+const toolLabels: Record<string, string> = {
+  get_meter_realtime: "实时功率",
+  get_energy_consumption: "周期电量",
+  compare_energy_periods: "电量对比",
+  calculate_rolling_15m_max_demand: "15分钟最大需量",
+  detect_power_peaks: "负荷峰值",
+  analyze_peak_average_ratio: "峰均比",
+  detect_declared_demand_exceedance: "申报需量越限",
+  detect_voltage_deviation: "电压偏差",
+  detect_three_phase_imbalance: "三相不平衡",
+  detect_power_factor_anomaly: "功率因数",
+  detect_thdu_thdi_anomaly: "THD异常",
+  analyze_3_5_7_harmonics: "谐波特征",
+  calculate_power_quality_abnormal_duration: "异常持续时间",
+  get_compressor_realtime: "空压实时状态",
+  analyze_compressor_load_unload_rate: "加载/卸载率",
+  detect_compressor_idle_running: "空载运行",
+  detect_compressor_frequent_starts: "频繁启停",
+  analyze_compressor_pressure_fluctuation: "压力波动",
+  detect_compressor_high_supply_pressure: "供气压力",
+  calculate_compressor_specific_power: "系统比功率",
+  detect_compressor_leakage: "泄漏筛查",
+  estimate_compressor_energy_saving: "节能量筛查",
+};
+
+function valueOf(payload: TelemetryPayload | undefined, key: string): number | undefined {
+  const samples = payload?.[key];
+  if (!samples?.length) return undefined;
+  const latest = samples.reduce((current, sample) => sample.ts > current.ts ? sample : current);
+  if (typeof latest.value === "number" && Number.isFinite(latest.value)) return latest.value;
+  if (typeof latest.value === "string" && latest.value.trim() !== "") {
+    const parsed = Number(latest.value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function stateOf(payload: TelemetryPayload | undefined, key: string): string | undefined {
+  const samples = payload?.[key];
+  if (!samples?.length) return undefined;
+  const latest = samples.reduce((current, sample) => sample.ts > current.ts ? sample : current);
+  return String(latest.value);
+}
+
+function seriesOf(payload: TelemetryPayload | undefined, key: string): number[] {
+  return (payload?.[key] || [])
+    .slice()
+    .sort((a, b) => a.ts - b.ts)
+    .map(sample => typeof sample.value === "number" ? sample.value : Number(sample.value))
+    .filter(value => Number.isFinite(value));
+}
+
+function format(value: number | undefined | null, digits = 1): string {
+  if (value === undefined || value === null || !Number.isFinite(value)) return "—";
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: digits, minimumFractionDigits: digits }).format(value);
+}
+
+function latestRecord<T>(values: Record<string, T> | undefined): T | undefined {
+  return values ? Object.values(values)[0] : undefined;
+}
+
+function inlineMarkdown(text: string): ReactNode[] {
+  return text.split(/(\*\*[^*]+\*\*)/g).map((part, index) =>
+    part.startsWith("**") && part.endsWith("**")
+      ? <strong key={index}>{part.slice(2, -2)}</strong>
+      : part,
+  );
+}
+
+function Markdown({ text }: { text: string }) {
+  return <div className="markdown">{text.split(/\r?\n/).map((raw, index) => {
+    const line = raw.trim();
+    if (!line) return <div className="markdown-space" key={index} />;
+    const heading = line.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) return <h4 key={index}>{inlineMarkdown(heading[2])}</h4>;
+    if (line.startsWith("- ")) return <div className="markdown-item" key={index}><i />{inlineMarkdown(line.slice(2))}</div>;
+    const ordered = line.match(/^(\d+)\.\s+(.+)$/);
+    if (ordered) return <div className="markdown-item" key={index}><b>{ordered[1]}</b>{inlineMarkdown(ordered[2])}</div>;
+    if (line.startsWith("> ")) return <blockquote key={index}>{inlineMarkdown(line.slice(2))}</blockquote>;
+    return <p key={index}>{inlineMarkdown(line)}</p>;
+  })}</div>;
+}
 
 function Login({ onLogin }: { onLogin: (token: string) => void }) {
   const [email, setEmail] = useState("admin@arthra.local");
   const [password, setPassword] = useState("Arthra@123456");
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   async function submit(event: FormEvent) {
-    event.preventDefault(); setError("");
-    const response = await fetch(`${API_BASE}/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password }) });
-    if (!response.ok) { setError("登录失败，请检查账号和密码"); return; }
-    onLogin((await response.json()).access_token);
+    event.preventDefault();
+    setBusy(true); setError("");
+    try {
+      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api/v1"}/auth/login`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password }),
+      });
+      if (!response.ok) throw new Error("登录失败，请检查账号和密码");
+      onLogin((await response.json()).access_token);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "登录失败");
+    } finally { setBusy(false); }
   }
   return <main className="login-shell">
-    <div className="login-mark">A</div>
-    <form className="login-card" onSubmit={submit}>
-      <p className="eyebrow">ARTHRA PLATFORM</p><h1>AI 能碳大脑</h1>
-      <p className="muted">连接数据、专家与设备，让每一次能源决策可解释、可审批、可追溯。</p>
-      <label>邮箱<input value={email} onChange={e => setEmail(e.target.value)} /></label>
-      <label>密码<input type="password" value={password} onChange={e => setPassword(e.target.value)} /></label>
-      {error && <p className="error">{error}</p>}<button type="submit">进入控制台</button>
+    <div className="login-brand"><strong>AethraVista<sup>TM</sup></strong><span>AI 能碳运营管理平台</span></div>
+    <form className="login-panel" onSubmit={submit}>
+      <p>INDUSTRIAL INTELLIGENCE</p><h1>进入能碳驾驶舱</h1>
+      <label>账号<input value={email} onChange={event => setEmail(event.target.value)} autoComplete="username" /></label>
+      <label>密码<input type="password" value={password} onChange={event => setPassword(event.target.value)} autoComplete="current-password" /></label>
+      {error && <div className="error-banner">{error}</div>}
+      <button disabled={busy}>{busy ? "正在连接…" : "登录"}</button>
     </form>
   </main>;
 }
 
-function Dashboard({ devices }: { devices: Device[] }) {
-  const cards = [
-    ["实时功率", "375.8", "kW", "+2.4%"], ["今日用电", "4,218", "kWh", "-6.1%"],
-    ["运行设备", String(devices.length || 3), "台", "正常"], ["待处理告警", "1", "条", "需关注"],
-  ];
-  return <section><div className="page-title"><div><p className="eyebrow">ENERGY OVERVIEW</p><h2>能源运行总览</h2></div><span className="live">● 实时更新</span></div>
-    <div className="metrics">{cards.map(card => <article className="metric" key={card[0]}><span>{card[0]}</span><strong>{card[1]} <small>{card[2]}</small></strong><em>{card[3]}</em></article>)}</div>
-    <div className="split"><article className="panel chart"><div className="panel-head"><h3>24 小时负荷趋势</h3><span>kW</span></div><div className="bars">{[45,52,48,63,57,70,67,78,65,72,61,55,68,74,81,76,69,62,58,66,73,64,52,47].map((h,i)=><i key={i} style={{height:`${h}%`}} />)}</div></article>
-    <article className="panel"><div className="panel-head"><h3>设备状态</h3><span>{devices.length || 3} 台</span></div><div className="device-list">{(devices.length ? devices : [{id:{id:"1"},name:"Arthra-EMS-01",type:"ems"},{id:{id:"2"},name:"Arthra-Meter-01",type:"meter"},{id:{id:"3"},name:"Arthra-Compressor-01",type:"compressor"}]).map(d=><div className="device" key={d.id.id}><b>{d.name}</b><span>{d.type}</span><em>● 在线</em></div>)}</div></article></div>
-  </section>;
-}
-
-function Chat({ token, devices }: { token: string; devices: Device[] }) {
-  const [threadId] = useState(() => `web-${crypto.randomUUID()}`);
-  const [input, setInput] = useState("分析当前能源运行状态并给出建议");
-  const [messages, setMessages] = useState<Array<{who:string;text:string}>>([{who:"ai",text:"你好，我是 Arthra。可以让我分析 EMS、电力、空压机、趋势预警或生成能碳报告。"}]);
-  const [busy, setBusy] = useState(false);
-  const [selected, setSelected] = useState<string[]>([]);
-  useEffect(()=>{setSelected(current=>current.length?current:devices.map(device=>device.id.id));},[devices]);
-  function toggleDevice(id:string){setSelected(current=>current.includes(id)?current.filter(value=>value!==id):[...current,id]);}
-  async function send(event: FormEvent) {
-    event.preventDefault(); if (!input.trim() || busy) return;
-    const question=input; setInput(""); setMessages(m=>[...m,{who:"you",text:question}]); setBusy(true);
-    try {
-      const response=await fetch(`${API_BASE}/chat`,{method:"POST",headers:{"Authorization":`Bearer ${token}`,"Content-Type":"application/json"},body:JSON.stringify({thread_id:threadId,message:question,device_scope:selected})});
-      if(!response.ok) throw new Error("对话请求失败");
-      const reader=response.body!.getReader(); const decoder=new TextDecoder(); let buffer=""; let answer="";
-      while(true){const {done,value}=await reader.read(); if(done)break; buffer+=decoder.decode(value,{stream:true}); const parts=buffer.split("\n\n"); buffer=parts.pop()||""; for(const part of parts){const line=part.split("\n").find(x=>x.startsWith("data: ")); if(!line)continue; const event=JSON.parse(line.slice(6)); if(event.event==="message") answer=event.content.message; if(event.event==="error") answer=event.content.message;}}
-      setMessages(m=>[...m,{who:"ai",text:answer||"分析完成，但没有返回文本。"}]);
-    } catch(error){setMessages(m=>[...m,{who:"ai",text:error instanceof Error?error.message:"请求失败"}]);} finally{setBusy(false);}
-  }
-  return <section className="chat-page"><div className="page-title"><div><p className="eyebrow">MULTI-AGENT WORKSPACE</p><h2>专家协同分析</h2></div></div><div className="device-picker"><div><b>分析设备范围</b><span>已选择 {selected.length} / {devices.length}</span></div><div className="device-chips">{devices.map(device=><button type="button" key={device.id.id} className={selected.includes(device.id.id)?"selected":""} onClick={()=>toggleDevice(device.id.id)}><i>{selected.includes(device.id.id)?"✓":"+"}</i><span>{device.name}<small>{device.type}</small></span></button>)}</div>{!devices.length&&<p>正在从 ThingsBoard 加载设备…</p>}</div><div className="chat-panel"><div className="messages">{messages.map((m,i)=><div className={`bubble ${m.who}`} key={i}><span>{m.who==="ai"?"A":"你"}</span><p>{m.text}</p></div>)}{busy&&<div className="thinking">Arthra 正在读取 ThingsBoard 数据并调用专家分析…</div>}</div><form className="composer" onSubmit={send}><textarea value={input} onChange={e=>setInput(e.target.value)} placeholder="询问能源运行、设备状态或节能建议…"/><button disabled={!selected.length||busy}>发送</button></form></div></section>;
-}
-
-function DailySummaries({ token, devices }: { token: string; devices: Device[] }) {
-  const summaryDevices = useMemo(
-    () => devices.filter(device => ["ems", "meter", "compressor"].includes(device.type)),
-    [devices],
-  );
+function useOperationsData(token: string) {
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [snapshots, setSnapshots] = useState<DeviceSnapshot[]>([]);
   const [summaries, setSummaries] = useState<DailySummary[]>([]);
-  const [selected, setSelected] = useState<string[]>([]);
-  const [active, setActive] = useState<DailySummary | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [powerAnalysis, setPowerAnalysis] = useState<PowerAnalysisResult | null>(null);
+  const [compressorAnalysis, setCompressorAnalysis] = useState<CompressorAnalysisResult | null>(null);
+  const [loading, setLoading] = useState(Boolean(token));
+  const [summaryBusy, setSummaryBusy] = useState(false);
   const [error, setError] = useState("");
+
   useEffect(() => {
-    setSelected(current => current.length ? current : summaryDevices.map(device => device.id.id));
-  }, [summaryDevices]);
-  const load = () => api<DailySummary[]>("/daily-summaries", token).then(rows => {
-    setSummaries(rows); setActive(current => current || rows[0] || null);
-  }).catch(reason => setError(reason instanceof Error ? reason.message : "摘要加载失败"));
-  useEffect(() => { void load(); }, [token]);
-  function toggleDevice(id: string) {
-    setSelected(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id]);
-  }
-  async function generate() {
-    if (!selected.length || busy) return;
-    setBusy(true); setError("");
+    if (!token) {
+      setLoading(false);
+      return;
+    }
+    let active = true;
+    async function load() {
+      setLoading(true); setError("");
+      try {
+        const page = await api<{ data: Device[] }>("/devices", token);
+        const relevant = (page.data || []).filter(device => ["ems", "meter", "compressor"].includes(device.type));
+        if (!active) return;
+        setDevices(relevant);
+        const now = Date.now();
+        const start = now - 24 * 60 * 60 * 1000;
+        const rows = await Promise.all(relevant.map(async device => {
+          const keys = device.type === "meter"
+            ? ["meter_TotW", "meter_SupWh", "meter_TotPF", "meter_ImbNgV", "meter_ImbNgA", "meter_ThdPhV_phsA", "meter_ThdPhV_phsB", "meter_ThdPhV_phsC", "meter_ThdA_phsA", "meter_ThdA_phsB", "meter_ThdA_phsC"]
+            : device.type === "compressor"
+              ? ["air_comp_supply_pressure", "air_comp_discharge_temp", "air_comp_running_state", "air_comp_load_state", "air_comp_running_flag", "air_comp_loaded_flag", "air_comp_fad_flow_m3_min"]
+              : ["power_kw", "energy_kwh", "soc", "mode"];
+          const keyQuery = encodeURIComponent(keys.join(","));
+          const [telemetry, history, alarmPage] = await Promise.all([
+            api<TelemetryPayload>(`/devices/${device.id.id}/telemetry?keys=${keyQuery}`, token).catch(() => ({})),
+            api<TelemetryPayload>(`/devices/${device.id.id}/telemetry?keys=${keyQuery}&start_ts=${start}&end_ts=${now}`, token).catch(() => ({})),
+            api<{ data: Alarm[] }>(`/devices/${device.id.id}/alarms`, token).catch(() => ({ data: [] })),
+          ]);
+          return { device, telemetry, history, alarms: alarmPage.data || [] };
+        }));
+        const recentSummaries = await api<DailySummary[]>("/daily-summaries?limit=7", token).catch(() => []);
+        if (!active) return;
+        setSnapshots(rows); setSummaries(recentSummaries);
+
+        const meter = relevant.find(device => device.type === "meter");
+        const compressor = relevant.find(device => device.type === "compressor");
+        if (meter) {
+          void api<PowerAnalysisResult>("/power-analysis", token, {
+            method: "POST",
+            body: JSON.stringify({
+              message: "为前端驾驶舱计算需量与电能质量指标",
+              device_scope: [meter.id.id], interval_seconds: 300,
+              capabilities: ["demand_15m", "peak_average_ratio", "declared_demand_exceedance", "power_factor", "phase_imbalance", "thd", "harmonics", "abnormal_duration"],
+            }),
+          }).then(result => active && setPowerAnalysis(result)).catch(() => active && setPowerAnalysis(null));
+        }
+        if (compressor) {
+          void api<CompressorAnalysisResult>("/compressor-analysis", token, {
+            method: "POST",
+            body: JSON.stringify({
+              message: "为前端驾驶舱计算空压系统运行指标",
+              device_scope: [compressor.id.id], interval_seconds: 300,
+              capabilities: ["realtime_status", "load_rate", "idle_running", "frequent_start", "pressure_fluctuation", "high_pressure", "specific_power", "leakage", "savings"],
+            }),
+          }).then(result => active && setCompressorAnalysis(result)).catch(() => active && setCompressorAnalysis(null));
+        }
+      } catch (reason) {
+        if (active) setError(reason instanceof Error ? reason.message : "工业数据加载失败");
+      } finally { if (active) setLoading(false); }
+    }
+    void load();
+    const timer = window.setInterval(load, 60_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [token]);
+
+  async function refreshSummary() {
+    if (!token || summaryBusy) return;
+    setSummaryBusy(true);
+    setError("");
     try {
-      const result = await api<DailySummary>("/daily-summaries/generate", token, {
-        method: "POST", body: JSON.stringify({ device_scope: selected }),
+      const summary = await api<DailySummary>("/daily-summaries/generate", token, {
+        method: "POST",
+        body: JSON.stringify({ device_scope: devices.map(device => device.id.id) }),
       });
-      setActive(result); setSummaries(current => [result, ...current.filter(item => item.id !== result.id)]);
+      setSummaries(current => [summary, ...current.filter(item => item.id !== summary.id)].slice(0, 7));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "摘要生成失败");
-    } finally { setBusy(false); }
+      setError(reason instanceof Error ? reason.message : "AI 每日摘要生成失败");
+    } finally {
+      setSummaryBusy(false);
+    }
   }
-  const overview = active?.statistics.overview;
-  return <section className="daily-page">
-    <div className="page-title"><div><p className="eyebrow">AI DAILY BRIEFING</p><h2>AI 每日摘要</h2></div><span className="live">每天自动生成 · 可手动刷新</span></div>
-    <div className="device-picker"><div><b>摘要设备范围</b><span>已选择 {selected.length} / {summaryDevices.length}</span></div><div className="device-chips">{summaryDevices.map(device => <button type="button" key={device.id.id} className={selected.includes(device.id.id) ? "selected" : ""} onClick={() => toggleDevice(device.id.id)}><i>{selected.includes(device.id.id) ? "✓" : "+"}</i><span>{device.name}<small>{device.type}</small></span></button>)}</div></div>
-    <div className="summary-actions"><button onClick={generate} disabled={!selected.length || busy}>{busy ? "正在汇总 ThingsBoard 数据并生成…" : "立即生成今日摘要"}</button><span>统计窗口：生成时刻向前 24 小时</span></div>
-    {error && <p className="error">{error}</p>}
-    {active && <>
-      <div className="summary-metrics">
-        <article><span>覆盖设备</span><b>{overview?.available_device_count ?? 0}/{overview?.device_count ?? 0}</b></article>
-        <article><span>平均有功功率</span><b>{overview?.average_active_power_kw?.toFixed(1) ?? "--"}<small> kW</small></b></article>
-        <article><span>窗口用电增量</span><b>{overview?.energy_consumption_kwh?.toFixed(1) ?? "--"}<small> kWh</small></b></article>
-        <article><span>提醒 / 告警</span><b>{overview?.warning_count ?? 0}<small> / {overview?.alarm_count ?? 0}</small></b></article>
-      </div>
-      <div className="summary-layout"><article className="panel summary-report"><div className="panel-head"><div><h3>{active.title}</h3><small>{new Date(active.period_start).toLocaleString("zh-CN")} 至 {new Date(active.period_end).toLocaleString("zh-CN")}</small></div><span>{active.status} · {active.model_name}</span></div><pre>{active.content}</pre></article>
-      <aside className="panel summary-history"><div className="panel-head"><h3>历史摘要</h3><span>{summaries.length}</span></div>{summaries.map(summary => <button key={summary.id} className={active.id === summary.id ? "active" : ""} onClick={() => setActive(summary)}><b>{summary.summary_date}</b><span>{summary.trigger === "scheduled" ? "自动" : "手动"} · {new Date(summary.created_at).toLocaleTimeString("zh-CN", {hour:"2-digit",minute:"2-digit"})}</span></button>)}</aside></div>
-    </>}
-    {!active && !busy && <div className="panel empty">尚无每日摘要，请选择设备后生成第一份摘要。</div>}
+
+  return { devices, snapshots, summaries, powerAnalysis, compressorAnalysis, loading, error, summaryBusy, refreshSummary };
+}
+
+function Bars({ values }: { values: number[] }) {
+  const samples = values.length > 48
+    ? values.filter((_, index) => index % Math.ceil(values.length / 48) === 0)
+    : values;
+  const max = Math.max(...samples, 1);
+  if (!samples.length) return <div className="chart-empty">暂无24小时历史数据</div>;
+  return <div className="load-bars" aria-label="24小时负荷趋势">{samples.map((value, index) =>
+    <i key={index} style={{ height: `${Math.max(4, value / max * 100)}%` }} title={`${format(value, 2)} kW`} />
+  )}</div>;
+}
+
+function Ring({ value, label }: { value: number | undefined; label: string }) {
+  const safe = Math.max(0, Math.min(100, value || 0));
+  return <div className="score-ring" style={{ "--score": `${safe * 3.6}deg` } as React.CSSProperties}>
+    <div><strong>{value === undefined ? "—" : Math.round(value)}</strong><span>{label}</span></div>
+  </div>;
+}
+
+function insightToneIcon(tone: InsightTone, icon: string) {
+  if (icon) return icon;
+  if (tone === "amber") return "!";
+  if (tone === "green") return "+";
+  return "AI";
+}
+
+function InsightCard({ insight, open, evidenceOpen, onToggle, onEvidence, onAsk, onClose }: {
+  insight: PageInsight;
+  open: boolean;
+  evidenceOpen: boolean;
+  onToggle: () => void;
+  onEvidence: () => void;
+  onAsk: () => void;
+  onClose: () => void;
+}) {
+  return <div className={`insight-card-shell ${open ? "open" : ""}`}>
+    <button className={`insight-card ${insight.tone}`} type="button" onClick={onToggle} aria-expanded={open} aria-controls={`insight-detail-${insight.id}`}>
+      <i>{insightToneIcon(insight.tone, insight.icon)}</i>
+      <span><strong>{insight.title}</strong><small>{insight.summary}</small></span><b aria-hidden="true">›</b>
+    </button>
+    {open && <section className="insight-detail" id={`insight-detail-${insight.id}`} aria-label={`${insight.title}洞察详情`}>
+      <header><strong>{insight.title} · 洞察详情</strong><button type="button" onClick={onClose} aria-label="关闭洞察详情">×</button></header>
+      <span className="insight-detail-badge">{insight.badge}</span>
+      <h3>{insight.detailTitle}</h3>
+      <p>{insight.detailSummary}</p>
+      <dl>{insight.metrics.map(metric => <div key={metric.label}><dt>{metric.label}</dt><dd className={metric.tone || ""}>{metric.value}</dd></div>)}</dl>
+      {evidenceOpen && <div className="insight-evidence-panel"><strong>数据依据</strong>{insight.evidence.map(item => <div key={item.label}><span>{item.label}</span><b>{item.value}</b></div>)}</div>}
+      <footer><button type="button" className={evidenceOpen ? "selected" : ""} onClick={onEvidence}>▤ {evidenceOpen ? "收起证据" : "查看证据"}</button><button type="button" onClick={onAsk}>··· 追问 AI</button></footer>
+    </section>}
+  </div>;
+}
+
+function formatDateTime(value: string | number | undefined) {
+  if (value === undefined) return "暂无时间信息";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "暂无时间信息" : date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+}
+
+function InsightRail({
+  workspace, summary, snapshots, powerAnalysis, compressorAnalysis, summaryBusy, onRefresh, onAsk,
+}: {
+  workspace: Workspace;
+  summary?: DailySummary;
+  snapshots: DeviceSnapshot[];
+  powerAnalysis: PowerAnalysisResult | null;
+  compressorAnalysis: CompressorAnalysisResult | null;
+  summaryBusy: boolean;
+  onRefresh: () => void;
+  onAsk: (prompt: string) => void;
+}) {
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const overview = summary?.statistics.overview;
+  const coverage = overview?.device_count ? overview.available_device_count / overview.device_count * 100 : snapshots.length ? 100 : undefined;
+  const dataTrust = coverage === undefined ? "待评估" : coverage >= 95 ? "高" : coverage >= 75 ? "中" : "低";
+  const demand = latestRecord(powerAnalysis?.metrics?.demand);
+  const quality = latestRecord(powerAnalysis?.metrics?.quality);
+  const compressorDevice = latestRecord(compressorAnalysis?.metrics?.devices);
+  const compressorRealtime = latestRecord(compressorAnalysis?.metrics?.realtime);
+  const compressorPressure = latestRecord(compressorAnalysis?.metrics?.pressure);
+  const activeAlarms = snapshots.flatMap(snapshot => snapshot.alarms.map(alarm => ({ ...alarm, deviceName: snapshot.device.name })));
+  const highAlarms = activeAlarms.filter(alarm => ["CRITICAL", "MAJOR"].includes(alarm.severity)).length;
+  const powerWarnings = powerAnalysis?.warnings || [];
+  const compressorWarnings = compressorAnalysis?.warnings || [];
+  const warningCount = (summary?.warnings.length || 0) + powerWarnings.length + compressorWarnings.length;
+  const maxThdi = quality?.thdi ? Math.max(...Object.values(quality.thdi).map(item => item.max || 0)) : undefined;
+  const maxThdu = quality?.thdu ? Math.max(...Object.values(quality.thdu).map(item => item.max || 0)) : undefined;
+  const demandMargin = demand?.declared_demand_kw != null && demand.max_demand_15m_kw != null ? demand.declared_demand_kw - demand.max_demand_15m_kw : undefined;
+  const peakSpread = demand?.instantaneous_peak_kw != null && demand.average_load_kw != null ? demand.instantaneous_peak_kw - demand.average_load_kw : undefined;
+  const savings = compressorAnalysis?.metrics?.savings_screening;
+  const latestTs = snapshots.reduce((latest, snapshot) => Math.max(latest, ...Object.values(snapshot.telemetry).flat().map(sample => sample.ts)), 0);
+  const scopeText = overview ? `${overview.available_device_count}/${overview.device_count} 台设备可用` : `${snapshots.length} 台设备`;
+  const periodText = summary ? `${formatDateTime(summary.period_start)} 至 ${formatDateTime(summary.period_end)}` : "最近 24 小时";
+  const baseEvidence: InsightEvidence[] = [
+    { label: "对象范围", value: scopeText },
+    { label: "数据截止", value: latestTs ? formatDateTime(latestTs) : "暂无有效时点" },
+    { label: "数据来源", value: "统一工业数据接口" },
+  ];
+
+  const pageConfig = useMemo<{ title: string; statusLabel: string; scoreLabel: string; insights: PageInsight[] }>(() => {
+    const overviewInsights: PageInsight[] = [
+      { id: "overview-business", icon: "↗", tone: "cyan", title: "经营概览", badge: "今日重点",
+        summary: overview?.average_active_power_kw != null ? `平均有功功率 ${format(overview.average_active_power_kw)} kW` : "等待每日运行摘要",
+        detailTitle: overview?.average_active_power_kw != null ? "当前能源运行指标已形成确定性摘要。" : "当前摘要数据仍在准备中。",
+        detailSummary: overview?.energy_consumption_kwh != null ? `统计期用电量 ${format(overview.energy_consumption_kwh)} kWh，结论仅覆盖已接入设备。` : "尚未获得可校验的统计期用电量，不补造单位产值能耗。",
+        metrics: [
+          { label: "负荷峰值", value: demand?.instantaneous_peak_kw != null ? `${format(demand.instantaneous_peak_kw)} kW` : "暂无有效数据" },
+          { label: "统计期用电量", value: overview?.energy_consumption_kwh != null ? `${format(overview.energy_consumption_kwh)} kWh` : "数据不足", tone: "green" },
+          { label: "数据可信度", value: dataTrust, tone: coverage !== undefined && coverage >= 75 ? "cyan" : "amber" },
+        ], evidence: [{ label: "统计周期", value: periodText }, ...baseEvidence], prompt: "展开经营概览，说明当前负荷、统计期用电量和数据依据" },
+      { id: "overview-risk", icon: "!", tone: warningCount || activeAlarms.length ? "amber" : "green", title: "异常风险", badge: "风险摘要",
+        summary: warningCount || activeAlarms.length ? `发现 ${warningCount + activeAlarms.length} 条待关注信息` : "当前未发现确定性异常提醒",
+        detailTitle: warningCount || activeAlarms.length ? "当前存在需要人工核验的运行提醒。" : "当前规则与活动告警未发现明显异常。",
+        detailSummary: [...(summary?.warnings || []), ...powerWarnings, ...compressorWarnings][0]?.message || "继续保持监测，告警结论以当前数据范围为限。",
+        metrics: [
+          { label: "分析提醒", value: `${warningCount} 条`, tone: warningCount ? "amber" : "green" },
+          { label: "活动告警", value: `${activeAlarms.length} 条`, tone: activeAlarms.length ? "amber" : "green" },
+          { label: "高优先级", value: `${highAlarms} 条`, tone: highAlarms ? "amber" : "green" },
+        ], evidence: [...baseEvidence, { label: "告警来源", value: "设备告警与确定性规则" }], prompt: "解释当前异常风险，按优先级说明影响对象和证据" },
+      { id: "overview-saving", icon: "↓", tone: savings?.screening_savings_kwh ? "green" : "muted", title: "节能机会", badge: "节能筛查",
+        summary: savings?.screening_savings_kwh != null ? `筛查节能量 ${format(savings.screening_savings_kwh)} kWh` : "等待空压节能筛查结果",
+        detailTitle: savings?.screening_savings_kwh != null ? "空压系统存在可进一步核验的节能线索。" : "当前数据不足以量化节能机会。",
+        detailSummary: "节能量仅为确定性初筛，不换算金额，也不会直接下发控制指令。",
+        metrics: [
+          { label: "筛查节能量", value: savings?.screening_savings_kwh != null ? `${format(savings.screening_savings_kwh)} kWh` : "数据不足", tone: "green" },
+          { label: "卸载能耗", value: savings?.unloaded_energy_kwh != null ? `${format(savings.unloaded_energy_kwh)} kWh` : "数据不足" },
+          { label: "空载时长", value: compressorDevice?.idle_running_minutes != null ? `${format(compressorDevice.idle_running_minutes)} min` : "数据不足" },
+        ], evidence: [...baseEvidence, { label: "分析口径", value: "空压确定性节能初筛" }], prompt: "分析当前节能机会，说明筛查节能量、卸载能耗和适用边界" },
+      { id: "overview-carbon", icon: "CO₂", tone: "muted", title: "碳排洞察", badge: "核算准备度", summary: "碳排因子与产量基线尚未接入",
+        detailTitle: "当前不能生成正式碳排放或减排量。", detailSummary: "平台已有能耗数据，但仍缺少可审计排放因子、组织边界、产量和基准期。",
+        metrics: [{ label: "能耗数据", value: overview?.energy_consumption_kwh != null ? "已具备" : "待补充", tone: "green" }, { label: "排放因子", value: "未接入", tone: "amber" }, { label: "产量基线", value: "未接入", tone: "amber" }],
+        evidence: [...baseEvidence, { label: "核算状态", value: "仅完成能源数据准备" }], prompt: "说明当前碳核算的数据条件、缺口和下一步接入要求" },
+    ];
+
+    const demandInsights: PageInsight[] = [
+      { id: "demand-peak", icon: "!", tone: demandMargin != null && demandMargin < 0 ? "amber" : "cyan", title: "峰值风险", badge: "15 分钟需量",
+        summary: demandMargin == null ? "申报需量或滚动需量数据不足" : demandMargin < 0 ? `已超申报需量 ${format(Math.abs(demandMargin))} kW` : `距申报需量尚余 ${format(demandMargin)} kW`,
+        detailTitle: demandMargin == null ? "当前不能完成需量越限判断。" : demandMargin < 0 ? "15 分钟滚动需量已超过申报值。" : "当前 15 分钟滚动需量未超过申报值。",
+        detailSummary: "需量风险只使用 15 分钟滚动需量判定，不以实时功率或周期不明的寄存器替代。",
+        metrics: [{ label: "最大滚动需量", value: demand?.max_demand_15m_kw != null ? `${format(demand.max_demand_15m_kw)} kW` : "数据不足" }, { label: "申报需量", value: demand?.declared_demand_kw != null ? `${format(demand.declared_demand_kw)} kW` : "未配置" }, { label: "剩余裕度", value: demandMargin != null ? `${format(demandMargin)} kW` : "无法计算", tone: demandMargin != null && demandMargin < 0 ? "amber" : "green" }],
+        evidence: [...baseEvidence, { label: "判定口径", value: "15 分钟滚动平均 vs 申报需量" }], prompt: "解释当前15分钟需量风险、申报需量裕度和判断依据" },
+      { id: "demand-shaving", icon: "∿", tone: peakSpread != null && peakSpread > 0 ? "green" : "muted", title: "削峰机会", badge: "峰值优化线索",
+        summary: peakSpread != null ? `峰值高于平均负荷 ${format(peakSpread)} kW` : "等待峰值与平均负荷数据",
+        detailTitle: peakSpread != null ? "负荷曲线存在可进一步核验的峰均差。" : "当前无法识别可量化的削峰空间。",
+        detailSummary: "该结果仅表示历史负荷差异，不等同于可调负荷容量或可直接执行的削峰量。",
+        metrics: [{ label: "瞬时峰值", value: demand?.instantaneous_peak_kw != null ? `${format(demand.instantaneous_peak_kw)} kW` : "数据不足" }, { label: "平均负荷", value: demand?.average_load_kw != null ? `${format(demand.average_load_kw)} kW` : "数据不足" }, { label: "峰均比", value: demand?.peak_average_ratio != null ? format(demand.peak_average_ratio, 3) : "数据不足", tone: "cyan" }],
+        evidence: [...baseEvidence, { label: "分析边界", value: "历史峰值线索，未建模可调资源" }], prompt: "分析负荷峰均差和削峰机会，但不要把历史峰值差当作可调容量" },
+      { id: "demand-execution", icon: "≡", tone: "muted", title: "执行状态", badge: "安全边界", summary: "当前页面仅提供只读分析",
+        detailTitle: "AI 不会直接执行需量控制。", detailSummary: "任何设备控制都必须先创建 proposed 计划，再经人工审批和服务端策略校验。",
+        metrics: [{ label: "当前能力", value: "只读分析" }, { label: "审批要求", value: "人工审批", tone: "cyan" }, { label: "自动执行", value: "禁止", tone: "amber" }],
+        evidence: [...baseEvidence, { label: "控制链路", value: "计划 → 审批 → 策略校验 → RPC" }], prompt: "说明当前需量分析可以做什么，以及控制计划的审批安全边界" },
+      { id: "demand-month", icon: "月", tone: "muted", title: "月度判断", badge: "统计周期", summary: "当前分析窗口不足以形成月度结论",
+        detailTitle: "月度需量判断需要完整计费周期数据。", detailSummary: "当前页面使用最近 24 小时数据，不会将短周期结果伪装成本月最大需量或未来预测。",
+        metrics: [{ label: "当前窗口", value: "最近 24 小时" }, { label: "月度最大需量", value: "数据不足" }, { label: "未来预测", value: "未接入" }],
+        evidence: [...baseEvidence, { label: "所需数据", value: "完整计费周期与需量预测结果" }], prompt: "说明为什么当前不能形成月度需量判断，以及还需要哪些数据" },
+    ];
+
+    const qualityInsights: PageInsight[] = [
+      { id: "quality-harmonic", icon: "∿", tone: maxThdi != null && maxThdi > 0 ? "amber" : "muted", title: "谐波风险", badge: "谐波筛查", summary: maxThdi != null ? `监测窗口最大 THDi ${format(maxThdi, 2)}%` : "等待谐波监测数据",
+        detailTitle: maxThdi != null ? "已形成谐波确定性筛查结果。" : "当前无法判断谐波风险。", detailSummary: "平台提醒不直接等同于适用标准超限，仍需结合 PCC、现场接线与采样质量核验。",
+        metrics: [{ label: "最大 THDi", value: maxThdi != null ? `${format(maxThdi, 2)}%` : "数据不足", tone: "amber" }, { label: "最大 THDu", value: maxThdu != null ? `${format(maxThdu, 2)}%` : "数据不足" }, { label: "数据可信度", value: dataTrust, tone: "cyan" }],
+        evidence: [...baseEvidence, { label: "分析来源", value: "三相 THD 确定性工具" }], prompt: "解释当前谐波风险、三相THD结果和现场核验边界" },
+      { id: "quality-reactive", icon: "φ", tone: quality?.power_factor?.latest != null && quality.power_factor.latest < .95 ? "amber" : "green", title: "无功优化", badge: "功率因数", summary: quality?.power_factor?.latest != null ? `当前功率因数 ${format(quality.power_factor.latest, 3)}` : "等待功率因数数据",
+        detailTitle: quality?.power_factor?.latest != null && quality.power_factor.latest < .95 ? "功率因数偏低，建议核查无功补偿状态。" : "当前功率因数未出现明显偏低线索。", detailSummary: "当前缺少补偿柜容量与无功功率数据，不计算补偿量或节省费用。",
+        metrics: [{ label: "当前值", value: format(quality?.power_factor?.latest, 3) }, { label: "窗口最低", value: format(quality?.power_factor?.min, 3) }, { label: "窗口最高", value: format(quality?.power_factor?.max, 3), tone: "green" }],
+        evidence: [...baseEvidence, { label: "优化边界", value: "仅提示功率因数线索" }], prompt: "分析当前功率因数和无功优化线索，说明缺失的数据条件" },
+      { id: "quality-voltage", icon: "V", tone: powerWarnings.length ? "amber" : "green", title: "电压事件", badge: "质量事件", summary: powerWarnings.length ? `${powerWarnings.length} 条电力质量提醒待核验` : "当前未产生电力质量提醒",
+        detailTitle: powerWarnings[0]?.message || "当前确定性工具未产生电压质量提醒。", detailSummary: "事件结论基于已执行的电压、不平衡与持续时间能力，不补造缺失相数据。",
+        metrics: [{ label: "电力提醒", value: `${powerWarnings.length} 条`, tone: powerWarnings.length ? "amber" : "green" }, { label: "电流不平衡", value: quality?.current_unbalance?.max != null ? `${format(quality.current_unbalance.max, 2)}%` : "数据不足" }, { label: "活动告警", value: `${activeAlarms.length} 条` }],
+        evidence: [...baseEvidence, { label: "事件来源", value: "电力确定性规则与活动告警" }], prompt: "解释当前电压和不平衡事件，列出影响与证据" },
+      { id: "quality-effect", icon: "✓", tone: "muted", title: "治理效果", badge: "效果基线", summary: "尚未建立治理前后对比基线",
+        detailTitle: "当前不能声称治理后指标已改善。", detailSummary: "需要治理动作、投运时间和同口径前后窗口，才能评价 APF、SVG 或补偿策略效果。",
+        metrics: [{ label: "治理动作", value: "未接入" }, { label: "对比基线", value: "未建立" }, { label: "当前监测", value: maxThdi != null ? "可用" : "数据不足", tone: "cyan" }],
+        evidence: [...baseEvidence, { label: "验效要求", value: "同对象、同口径、治理前后窗口" }], prompt: "说明电能质量治理效果评估需要哪些基线和证据" },
+    ];
+
+    const compressorInsights: PageInsight[] = [
+      { id: "compressor-group", icon: "◎", tone: compressorDevice?.unload_rate_pct != null && compressorDevice.unload_rate_pct > 20 ? "amber" : "cyan", title: "群控机会", badge: "运行协同", summary: compressorDevice?.unload_rate_pct != null ? `当前单机卸载率 ${format(compressorDevice.unload_rate_pct, 1)}%` : "群控数据范围不足",
+        detailTitle: "当前仅能提供已接入空压机的运行线索。", detailSummary: "未形成多机负荷排序时，不建议具体设备退出或自动执行群控。",
+        metrics: [{ label: "加载率", value: compressorDevice?.load_rate_pct != null ? `${format(compressorDevice.load_rate_pct, 1)}%` : "数据不足" }, { label: "卸载率", value: compressorDevice?.unload_rate_pct != null ? `${format(compressorDevice.unload_rate_pct, 1)}%` : "数据不足", tone: "amber" }, { label: "自动群控", value: "禁止", tone: "amber" }],
+        evidence: [...baseEvidence, { label: "分析边界", value: "当前设备范围内的只读运行分析" }], prompt: "分析空压机加载卸载和群控机会，不要给出未经审批的控制动作" },
+      { id: "compressor-pressure", icon: "P", tone: compressorWarnings.length ? "amber" : "green", title: "压力优化", badge: "供气压力", summary: compressorRealtime?.supply_pressure_mpa != null ? `当前母管压力 ${format(compressorRealtime.supply_pressure_mpa, 3)} MPa` : "等待压力数据",
+        detailTitle: compressorWarnings[0]?.message || "当前压力工具未产生明显异常提醒。", detailSummary: "压力下调幅度必须结合设备约束与末端需求验证，当前不直接给出控制设定值。",
+        metrics: [{ label: "当前压力", value: compressorRealtime?.supply_pressure_mpa != null ? `${format(compressorRealtime.supply_pressure_mpa, 3)} MPa` : "数据不足" }, { label: "窗口均值", value: compressorPressure?.avg_mpa != null ? `${format(compressorPressure.avg_mpa, 3)} MPa` : "数据不足" }, { label: "压力波动", value: compressorPressure?.p95_p5_mpa != null ? `${format(compressorPressure.p95_p5_mpa, 3)} MPa` : "数据不足" }],
+        evidence: [...baseEvidence, { label: "分析来源", value: "空压压力波动确定性工具" }], prompt: "分析当前供气压力、波动和压力优化边界" },
+      { id: "compressor-leak", icon: "○", tone: compressorWarnings.length ? "amber" : "muted", title: "泄漏风险", badge: "泄漏筛查", summary: compressorWarnings.length ? "存在空压异常提醒，建议核查非生产时段" : "当前没有独立泄漏率结果",
+        detailTitle: "泄漏结论需要有效流量和生产时段配置。", detailSummary: "现有结果仅作筛查，不能把缺失流量补零或将估算直接作为正式泄漏率。",
+        metrics: [{ label: "异常提醒", value: `${compressorWarnings.length} 条`, tone: compressorWarnings.length ? "amber" : "green" }, { label: "筛查泄漏率", value: "数据不足" }, { label: "现场核验", value: "需要" }],
+        evidence: [...baseEvidence, { label: "所需数据", value: "流量、生产时段与停产基线" }], prompt: "说明当前空压泄漏筛查结果和还需核验的数据" },
+      { id: "compressor-effect", icon: "↘", tone: savings?.screening_savings_kwh ? "green" : "muted", title: "运行效果", badge: "当期表现", summary: compressorAnalysis?.metrics?.specific_power?.average_kw_per_m3_min != null ? `系统比功率 ${format(compressorAnalysis.metrics.specific_power.average_kw_per_m3_min, 3)}` : "等待比功率结果",
+        detailTitle: "当前只展示同一分析窗口内的确定性指标。", detailSummary: "未建立昨日或治理前基线时，不声称比功率改善百分比。",
+        metrics: [{ label: "系统比功率", value: compressorAnalysis?.metrics?.specific_power?.average_kw_per_m3_min != null ? `${format(compressorAnalysis.metrics.specific_power.average_kw_per_m3_min, 3)} kW/(m³/min)` : "数据不足" }, { label: "筛查节能量", value: savings?.screening_savings_kwh != null ? `${format(savings.screening_savings_kwh)} kWh` : "数据不足", tone: "green" }, { label: "数据可信度", value: dataTrust, tone: "cyan" }],
+        evidence: [...baseEvidence, { label: "效果边界", value: "未建立跨期基线" }], prompt: "解释当前空压系统比功率、节能筛查和效果评价边界" },
+    ];
+
+    const carbonInsights: PageInsight[] = [
+      { id: "carbon-intensity", icon: "∿", tone: "muted", title: "排放强度", badge: "核算条件", summary: "缺少产量与排放因子，暂不可计算", detailTitle: "当前不具备正式排放强度计算条件。", detailSummary: "单位产值碳排需要可审计排放量与产值或产量口径，平台不会用能耗直接冒充碳强度。", metrics: [{ label: "能源数据", value: overview?.energy_consumption_kwh != null ? "已具备" : "待补充", tone: "green" }, { label: "排放因子", value: "未接入", tone: "amber" }, { label: "产量数据", value: "未接入", tone: "amber" }], evidence: [...baseEvidence, { label: "核算结论", value: "数据条件不足" }], prompt: "说明排放强度为什么暂不可计算，以及需要补充哪些数据" },
+      { id: "carbon-opportunity", icon: "↓", tone: savings?.screening_savings_kwh ? "green" : "muted", title: "减排机会", badge: "节电线索", summary: savings?.screening_savings_kwh != null ? `发现 ${format(savings.screening_savings_kwh)} kWh 节电筛查量` : "等待可核验的节电筛查结果", detailTitle: "节电量尚不能直接换算为减排量。", detailSummary: "接入适用排放因子和核算边界后，才能将已验证节电量换算为 tCO₂e。", metrics: [{ label: "节电筛查量", value: savings?.screening_savings_kwh != null ? `${format(savings.screening_savings_kwh)} kWh` : "数据不足", tone: "green" }, { label: "减排量", value: "不可计算" }, { label: "正式核验", value: "尚未完成" }], evidence: [...baseEvidence, { label: "换算状态", value: "排放因子未接入" }], prompt: "分析当前节电线索与减排量换算之间的边界" },
+      { id: "carbon-factor", icon: "↻", tone: "amber", title: "因子更新", badge: "版本管理", summary: "排放因子数据源与版本尚未接入", detailTitle: "当前没有可审计的电网排放因子版本。", detailSummary: "正式核算前需明确区域、适用年份、发布机构和生效日期。", metrics: [{ label: "因子来源", value: "未配置" }, { label: "版本日期", value: "未配置" }, { label: "适用区域", value: "未配置" }], evidence: [...baseEvidence, { label: "接入要求", value: "来源、版本、区域、生效日期" }], prompt: "说明碳排因子接入需要管理哪些版本信息" },
+      { id: "carbon-quality", icon: "▤", tone: coverage !== undefined && coverage >= 95 ? "green" : "amber", title: "数据质量", badge: "核算准备度", summary: coverage !== undefined ? `工业设备数据覆盖 ${format(coverage, 0)}%` : "等待工业数据覆盖结果", detailTitle: "能源数据覆盖不代表碳核算链路已经完整。", detailSummary: "还需补充组织边界、排放因子、产量和基准期，才能形成可复核碳数据。", metrics: [{ label: "设备覆盖", value: coverage !== undefined ? `${format(coverage, 0)}%` : "待评估", tone: "green" }, { label: "统计期电量", value: overview?.energy_consumption_kwh != null ? "可用" : "数据不足" }, { label: "碳核算状态", value: "未就绪", tone: "amber" }], evidence: [...baseEvidence, { label: "缺失维度", value: "边界、因子、产量、基线" }], prompt: "评估当前碳核算数据质量和缺失项" },
+    ];
+
+    const eventInsights: PageInsight[] = [
+      { id: "events-priority", icon: "!", tone: highAlarms ? "amber" : "cyan", title: "优先处置", badge: "事件优先级", summary: highAlarms ? `${highAlarms} 条高优先级活动告警` : activeAlarms.length ? `${activeAlarms.length} 条活动告警待确认` : "当前没有活动告警", detailTitle: highAlarms ? "高优先级事件需要先完成人工确认。" : "当前活动事件未出现高优先级告警。", detailSummary: activeAlarms[0] ? `${activeAlarms[0].deviceName} · ${activeAlarms[0].type}` : "继续保持事件监测与证据留存。", metrics: [{ label: "活动事件", value: `${activeAlarms.length} 条` }, { label: "高优先级", value: `${highAlarms} 条`, tone: highAlarms ? "amber" : "green" }, { label: "影响设备", value: `${new Set(activeAlarms.map(item => item.deviceName)).size} 台` }], evidence: [...baseEvidence, { label: "事件来源", value: "统一告警接口" }], prompt: "按优先级解释当前活动告警、影响设备和处置证据" },
+      { id: "events-quality", icon: "∿", tone: powerWarnings.length ? "amber" : "green", title: "治理异常", badge: "电力质量", summary: powerWarnings.length ? `${powerWarnings.length} 条电力治理提醒` : "当前没有电力治理提醒", detailTitle: powerWarnings[0]?.message || "当前电力确定性工具未产生异常。", detailSummary: "质量提醒不直接等同于标准超限，需结合现场与适用标准确认。", metrics: [{ label: "电力提醒", value: `${powerWarnings.length} 条`, tone: powerWarnings.length ? "amber" : "green" }, { label: "最大 THDi", value: maxThdi != null ? `${format(maxThdi, 2)}%` : "数据不足" }, { label: "功率因数", value: format(quality?.power_factor?.latest, 3) }], evidence: [...baseEvidence, { label: "分析来源", value: "电能质量确定性工具" }], prompt: "解释当前治理异常及其电能质量证据" },
+      { id: "events-saving", icon: "↓", tone: compressorWarnings.length ? "amber" : "green", title: "节能机会", badge: "空压事件", summary: compressorWarnings.length ? `${compressorWarnings.length} 条空压节能线索` : "当前没有空压异常提醒", detailTitle: compressorWarnings[0]?.message || "当前空压确定性工具未产生节能异常。", detailSummary: "节能线索需要现场核验，不能直接作为控制执行依据。", metrics: [{ label: "空压提醒", value: `${compressorWarnings.length} 条`, tone: compressorWarnings.length ? "amber" : "green" }, { label: "卸载率", value: compressorDevice?.unload_rate_pct != null ? `${format(compressorDevice.unload_rate_pct, 1)}%` : "数据不足" }, { label: "筛查节能量", value: savings?.screening_savings_kwh != null ? `${format(savings.screening_savings_kwh)} kWh` : "数据不足" }], evidence: [...baseEvidence, { label: "分析来源", value: "空压运行与节能筛查" }], prompt: "解释当前空压节能事件、影响和证据" },
+      { id: "events-verify", icon: "✓", tone: "muted", title: "验证提醒", badge: "闭环状态", summary: "事件责任、执行与效果验证尚未接入", detailTitle: "当前页面只展示活动告警与分析结果。", detailSummary: "没有正式闭环状态时，不会虚构待执行、执行中或已验证数量。", metrics: [{ label: "事件发现", value: activeAlarms.length ? "已接入" : "暂无事件", tone: "green" }, { label: "责任确认", value: "未接入" }, { label: "效果验证", value: "未接入" }], evidence: [...baseEvidence, { label: "闭环缺口", value: "责任人、执行记录、验证窗口" }], prompt: "说明当前智能事件闭环还缺少哪些责任、执行和验证数据" },
+    ];
+
+    if (workspace === "demand") return { title: "AI 需量洞察", statusLabel: "需量数据状态", scoreLabel: "数据覆盖", insights: demandInsights };
+    if (workspace === "quality") return { title: "AI 治理洞察", statusLabel: "电能质量数据", scoreLabel: "数据覆盖", insights: qualityInsights };
+    if (workspace === "compressor") return { title: "AI 节能洞察", statusLabel: "空压数据状态", scoreLabel: "数据覆盖", insights: compressorInsights };
+    if (workspace === "carbon") return { title: "AI 碳排洞察", statusLabel: "碳核算准备度", scoreLabel: "能源覆盖", insights: carbonInsights };
+    if (workspace === "events") return { title: "AI 事件洞察", statusLabel: "事件数据状态", scoreLabel: "数据覆盖", insights: eventInsights };
+    return { title: "AI 每日洞察", statusLabel: "工业数据覆盖", scoreLabel: "覆盖率", insights: overviewInsights };
+  }, [activeAlarms, baseEvidence, compressorDevice, compressorPressure, compressorRealtime, compressorWarnings, coverage, dataTrust, demand, demandMargin, highAlarms, maxThdi, maxThdu, overview, peakSpread, periodText, powerWarnings, savings, summary?.warnings, warningCount, workspace]);
+
+  useEffect(() => { setSelectedId(null); setEvidenceOpen(false); }, [workspace]);
+  useEffect(() => {
+    function onKeyDown(event: globalThis.KeyboardEvent) { if (event.key === "Escape") { setSelectedId(null); setEvidenceOpen(false); } }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  function toggleInsight(id: string) {
+    setSelectedId(current => current === id ? null : id);
+    setEvidenceOpen(false);
+  }
+
+  return <aside className="insight-rail">
+    <div className="rail-score">
+      <div><p>{pageConfig.statusLabel}</p><Ring value={coverage} label={pageConfig.scoreLabel} /></div>
+      <dl><div><dt>设备</dt><dd>{overview ? `${overview.available_device_count}/${overview.device_count}` : snapshots.length || "—"}</dd></div><div><dt>提醒</dt><dd>{warningCount + activeAlarms.length}</dd></div></dl>
+    </div>
+    <div className="rail-heading"><span>✦</span><h2>{pageConfig.title}</h2><small>{summary ? summary.summary_date : "实时分析"}</small>{workspace === "overview" && <button type="button" onClick={onRefresh} disabled={summaryBusy} title="重新生成每日摘要" aria-label="重新生成每日摘要">{summaryBusy ? "…" : "↻"}</button>}</div>
+    <div className="insight-list">{pageConfig.insights.map(insight => <InsightCard key={insight.id} insight={insight} open={selectedId === insight.id} evidenceOpen={selectedId === insight.id && evidenceOpen} onToggle={() => toggleInsight(insight.id)} onEvidence={() => setEvidenceOpen(current => !current)} onClose={() => { setSelectedId(null); setEvidenceOpen(false); }} onAsk={() => onAsk(insight.prompt)} />)}</div>
+  </aside>;
+}
+
+function EnergyMap({ meter, ems, compressor }: { meter?: DeviceSnapshot; ems?: DeviceSnapshot; compressor?: DeviceSnapshot }) {
+  const meterPower = valueOf(meter?.telemetry, "meter_TotW");
+  const emsPower = valueOf(ems?.telemetry, "power_kw");
+  const soc = valueOf(ems?.telemetry, "soc");
+  const pressure = valueOf(compressor?.telemetry, "air_comp_supply_pressure");
+  return <section className="energy-map">
+    <div className="map-title"><h2>源网荷储</h2><span>统一工业数据接口</span></div>
+    <div className="energy-node grid-node"><i>电网</i><strong>{format(meterPower)} <small>kW</small></strong><span>实时进线功率</span></div>
+    <div className="energy-node ems-node"><i>EMS</i><strong>{format(emsPower)} <small>kW</small></strong><span>SOC {format(soc)}%</span></div>
+    <div className="factory-core"><div className="factory-bars"><i /><i /><i /><i /></div><strong>能源运营中心</strong><span>AI 专家协同在线</span></div>
+    <div className="energy-node load-node"><i>负荷</i><strong>{format(meterPower)} <small>kW</small></strong><span>关键计量</span></div>
+    <div className="energy-node air-node"><i>空压</i><strong>{format(pressure, 3)} <small>MPa</small></strong><span>供气母管</span></div>
+    <div className="connector connector-a" /><div className="connector connector-b" /><div className="connector connector-c" /><div className="connector connector-d" />
   </section>;
 }
 
-function Knowledge({ token }: { token: string }) {
-  const [docs,setDocs]=useState<Array<{id:string;filename:string;status:string}>>([]); const [notice,setNotice]=useState("");
-  const load=()=>api<typeof docs>("/knowledge/documents",token).then(setDocs).catch(e=>setNotice(e.message)); useEffect(()=>{void load();},[token]);
-  async function upload(event:FormEvent<HTMLFormElement>){event.preventDefault();const input=event.currentTarget.elements.namedItem("file") as HTMLInputElement;if(!input.files?.[0])return;const body=new FormData();body.append("file",input.files[0]);await api("/knowledge/documents",token,{method:"POST",body});setNotice("文档已完成切分和向量化");load();}
-  return <section><div className="page-title"><div><p className="eyebrow">KNOWLEDGE RESOURCE</p><h2>企业知识库</h2></div></div><div className="split"><form className="panel upload" onSubmit={upload}><h3>添加知识文档</h3><p className="muted">支持 UTF-8 TXT、Markdown 与 CSV，单文件不超过 5 MB。</p><input name="file" type="file" accept=".txt,.md,.csv"/><button>上传并处理</button>{notice&&<p>{notice}</p>}</form><article className="panel"><div className="panel-head"><h3>已入库文档</h3><span>{docs.length}</span></div>{docs.map(d=><div className="document" key={d.id}><b>{d.filename}</b><em>{d.status}</em></div>)}{!docs.length&&<p className="empty">尚未上传文档</p>}</article></div></section>;
+function MetricTile({ icon, label, value, unit, note, tone = "cyan" }: { icon: string; label: string; value: string; unit: string; note: string; tone?: "cyan" | "green" | "amber" }) {
+  return <article className={`metric-tile ${tone}`}><header><i>{icon}</i><span>{label}</span></header><strong>{value} <small>{unit}</small></strong><p>{note}</p></article>;
 }
 
-function Approvals({ token, plans, reload }: { token:string;plans:ControlPlan[];reload:()=>void }) {
-  async function action(id:string,verb:"approve"|"reject"){await api(`/control-plans/${id}/${verb}`,token,{method:"POST",body:verb==="reject"?JSON.stringify({reason:"审批员拒绝"}):undefined});reload();}
-  return <section><div className="page-title"><div><p className="eyebrow">HUMAN IN THE LOOP</p><h2>设备控制审批</h2></div><span className="safety">AI 无法绕过此审批</span></div><div className="panel table-wrap"><table><thead><tr><th>设备</th><th>控制方法</th><th>参数</th><th>风险</th><th>状态</th><th>操作</th></tr></thead><tbody>{plans.map(p=><tr key={p.id}><td><b>{p.device_name}</b><small>{p.device_type}</small></td><td>{p.method}</td><td><code>{JSON.stringify(p.params)}</code></td><td>{p.risk_level}</td><td><span className={`status ${p.status}`}>{p.status}</span></td><td>{p.status==="proposed"&&<div className="actions"><button onClick={()=>action(p.id,"approve")}>批准执行</button><button className="ghost" onClick={()=>action(p.id,"reject")}>拒绝</button></div>}</td></tr>)}</tbody></table>{!plans.length&&<p className="empty">当前没有控制计划</p>}</div></section>;
+function Overview({ snapshots, powerAnalysis, compressorAnalysis }: { snapshots: DeviceSnapshot[]; powerAnalysis: PowerAnalysisResult | null; compressorAnalysis: CompressorAnalysisResult | null }) {
+  const meter = snapshots.find(row => row.device.type === "meter");
+  const ems = snapshots.find(row => row.device.type === "ems");
+  const compressor = snapshots.find(row => row.device.type === "compressor");
+  const power = valueOf(meter?.telemetry, "meter_TotW");
+  const pf = valueOf(meter?.telemetry, "meter_TotPF");
+  const energy = valueOf(meter?.telemetry, "meter_SupWh");
+  const demand = latestRecord(powerAnalysis?.metrics?.demand);
+  const realtime = latestRecord(compressorAnalysis?.metrics?.realtime);
+  const history = seriesOf(meter?.history, "meter_TotW");
+  return <div className="overview-workspace">
+    <EnergyMap meter={meter} ems={ems} compressor={compressor} />
+    <section className="trend-panel"><div className="section-head"><div><p>负荷趋势</p><h3>最近24小时实际负荷</h3></div><span>{history.length} 个有效样本</span></div><Bars values={history} /><div className="chart-axis"><span>24小时前</span><span>12小时前</span><span>当前</span></div></section>
+    <aside className="metric-rail">
+      <MetricTile icon="∿" label="当前负荷" value={format(power)} unit="kW" note={demand?.max_demand_15m_kw != null ? `15分钟最大需量 ${format(demand.max_demand_15m_kw)} kW` : "需量计算中"} />
+      <MetricTile icon="Σ" label="累计正向电量" value={format(energy)} unit="kWh" note="电表累计寄存器读数" tone="green" />
+      <MetricTile icon="φ" label="功率因数" value={format(pf, 3)} unit="" note={pf == null ? "暂无有效数据" : "平台确定性监测"} />
+      <MetricTile icon="P" label="空压供气压力" value={format(realtime?.supply_pressure_mpa, 3)} unit="MPa" note={realtime?.running == null ? "状态待获取" : realtime.running ? "空压机运行中" : "空压机已停止"} tone="amber" />
+    </aside>
+  </div>;
 }
 
-function Audit({ token }: {token:string}) { const [events,setEvents]=useState<Array<{id:string;action:string;resource_id:string;created_at:string;details:unknown}>>([]); useEffect(()=>{api<typeof events>("/audit-events",token).then(setEvents).catch(()=>setEvents([]));},[token]); return <section><div className="page-title"><div><p className="eyebrow">AUDIT TRAIL</p><h2>不可变操作记录</h2></div></div><div className="panel timeline">{events.map(e=><div key={e.id}><i/><p><b>{e.action}</b><span>{new Date(e.created_at).toLocaleString("zh-CN")}</span></p><code>{e.resource_id}</code></div>)}{!events.length&&<p className="empty">暂无记录或当前角色无查看权限</p>}</div></section>; }
+function InsightList({ title, warnings, empty }: { title: string; warnings?: Array<{ message?: string; severity?: string }>; empty: string }) {
+  return <section className="expert-insights"><div className="section-head"><div><p>AI 专家洞察</p><h3>{title}</h3></div><span>确定性工具结果</span></div>
+    <div>{warnings?.length ? warnings.slice(0, 4).map((warning, index) => <article key={index}><i className={warning.severity === "high" ? "danger" : "warning"}>!</i><p>{warning.message || "检测到需要关注的指标"}</p></article>) : <article><i>✓</i><p>{empty}</p></article>}</div>
+  </section>;
+}
 
-export default function App(){
-  const [token,setToken]=useState(()=>localStorage.getItem("arthra_token")||""); const [user,setUser]=useState<User|null>(null); const [view,setView]=useState<View>("dashboard"); const [devices,setDevices]=useState<Device[]>([]); const [plans,setPlans]=useState<ControlPlan[]>([]);
-  const reload=()=>{if(!token)return;api<{data:Device[]}>("/devices",token).then(r=>setDevices(r.data||[])).catch(()=>setDevices([]));api<ControlPlan[]>("/control-plans",token).then(setPlans).catch(()=>setPlans([]));};
-  useEffect(()=>{if(!token)return;api<User>("/auth/me",token).then(setUser).catch(()=>{setToken("");localStorage.removeItem("arthra_token")});reload();},[token]);
-  const pending=useMemo(()=>plans.filter(p=>p.status==="proposed").length,[plans]);
-  function loggedIn(value:string){localStorage.setItem("arthra_token",value);setToken(value)} if(!token)return <Login onLogin={loggedIn}/>;
-  return <div className="app"><aside><div className="brand"><b>A</b><div><strong>Arthra</strong><span>AI 能碳大脑</span></div></div><nav>{views.map(([id,label,icon])=><button key={id} className={view===id?"active":""} onClick={()=>setView(id)}><i>{icon}</i>{label}{id==="approvals"&&pending>0&&<em>{pending}</em>}</button>)}</nav><div className="profile"><span>{user?.email.slice(0,1).toUpperCase()}</span><div><b>{user?.email||"加载中"}</b><small>{user?.role}</small></div><button onClick={()=>{localStorage.clear();setToken("")}}>↗</button></div></aside><main className="content">{view==="dashboard"&&<Dashboard devices={devices}/>} {view==="daily"&&<DailySummaries token={token} devices={devices}/>} {view==="chat"&&<Chat token={token} devices={devices}/>} {view==="knowledge"&&<Knowledge token={token}/>} {view==="approvals"&&<Approvals token={token} plans={plans} reload={reload}/>} {view==="audit"&&<Audit token={token}/>}</main></div>;
+function DemandWorkspace({ analysis, history, onAsk }: { analysis: PowerAnalysisResult | null; history: number[]; onAsk: (prompt: string) => void }) {
+  const metric = latestRecord(analysis?.metrics?.demand);
+  const margin = metric?.declared_demand_kw != null && metric.max_demand_15m_kw != null ? metric.declared_demand_kw - metric.max_demand_15m_kw : undefined;
+  return <div className="domain-workspace">
+    <div className="domain-main"><div className="domain-heading"><div><p>LOAD & DEMAND EXPERT</p><h2>15 分钟需量监测</h2></div><button onClick={() => onAsk("分析当前15分钟最大需量、峰均比和申报需量风险")}>询问需量专家</button></div>
+      <div className="domain-metrics"><MetricTile icon="D" label="15分钟最大需量" value={format(metric?.max_demand_15m_kw)} unit="kW" note="滚动平均确定性计算" /><MetricTile icon="↥" label="负荷峰值" value={format(metric?.instantaneous_peak_kw)} unit="kW" note="60秒桶峰值" /><MetricTile icon="÷" label="峰均比" value={format(metric?.peak_average_ratio, 3)} unit="" note={metric?.average_load_kw != null ? `平均负荷 ${format(metric.average_load_kw)} kW` : "等待历史数据"} tone="green" /><MetricTile icon="△" label="剩余需量裕度" value={format(margin)} unit="kW" note={margin == null ? "申报需量未配置" : margin >= 0 ? "尚未发生需量越限" : "已发生需量越限"} tone={margin != null && margin < 0 ? "amber" : "green"} /></div>
+      <section className="wide-chart"><div className="section-head"><div><p>实际功率</p><h3>24小时负荷证据</h3></div><span>实时功率不等于计费需量</span></div><Bars values={history} /></section>
+    </div><InsightList title="需量风险与建议" warnings={analysis?.warnings} empty="当前已执行的需量工具未产生越限提醒，建议保持监测。" />
+  </div>;
+}
+
+function QualityWorkspace({ analysis, onAsk }: { analysis: PowerAnalysisResult | null; onAsk: (prompt: string) => void }) {
+  const quality = latestRecord(analysis?.metrics?.quality);
+  const thdi = quality?.thdi ? Math.max(...Object.values(quality.thdi).map(item => item.max || 0)) : undefined;
+  const thdu = quality?.thdu ? Math.max(...Object.values(quality.thdu).map(item => item.max || 0)) : undefined;
+  return <div className="domain-workspace"><div className="domain-main"><div className="domain-heading"><div><p>POWER QUALITY EXPERT</p><h2>电能质量实时监测</h2></div><button onClick={() => onAsk("分析电能质量，重点说明功率因数、三相不平衡和THD证据")}>询问电力专家</button></div>
+    <div className="domain-metrics"><MetricTile icon="φ" label="当前功率因数" value={format(quality?.power_factor?.latest, 3)} unit="" note={quality?.power_factor?.min != null ? `窗口最低 ${format(quality.power_factor.min, 3)}` : "暂无有效历史"} /><MetricTile icon="I" label="电流不平衡度" value={format(quality?.current_unbalance?.max, 2)} unit="%" note="异常需先核查CT和采样" tone="amber" /><MetricTile icon="Ui" label="最大 THDi" value={format(thdi, 2)} unit="%" note="平台阈值筛查" tone="amber" /><MetricTile icon="Uu" label="最大 THDu" value={format(thdu, 2)} unit="%" note="需结合PCC与适用标准" tone="green" /></div>
+    <section className="quality-spectrum"><div className="section-head"><div><p>质量证据</p><h3>监测结果边界</h3></div><span>不由 LLM 重算</span></div><div className="evidence-grid"><article><strong>规则计算</strong><span>阈值、持续时间和最大值由 Python 工具生成</span></article><article><strong>现场核验</strong><span>不平衡与 THD 提醒不直接等同于标准超限</span></article><article><strong>人工审批</strong><span>任何补偿或治理动作必须进入审批流程</span></article></div></section>
+  </div><InsightList title="电能质量异常" warnings={analysis?.warnings} empty="当前已执行的电能质量工具未产生平台级提醒。" /></div>;
+}
+
+function CompressorWorkspace({ analysis, onAsk }: { analysis: CompressorAnalysisResult | null; onAsk: (prompt: string) => void }) {
+  const device = latestRecord(analysis?.metrics?.devices);
+  const realtime = latestRecord(analysis?.metrics?.realtime);
+  const pressure = latestRecord(analysis?.metrics?.pressure);
+  const specific = analysis?.metrics?.specific_power;
+  return <div className="domain-workspace"><div className="domain-main"><div className="domain-heading"><div><p>COMPRESSED AIR EXPERT</p><h2>空压系统运行与优化</h2></div><button onClick={() => onAsk("分析空压系统加载卸载、压力、比功率和节能机会")}>询问空压专家</button></div>
+    <div className="domain-metrics"><MetricTile icon="P" label="供气压力" value={format(realtime?.supply_pressure_mpa ?? pressure?.avg_mpa, 3)} unit="MPa" note={pressure?.p95_p5_mpa != null ? `P95-P5 波动 ${format(pressure.p95_p5_mpa, 3)} MPa` : "压力历史计算中"} /><MetricTile icon="L" label="加载率" value={format(device?.load_rate_pct, 2)} unit="%" note={device?.unload_rate_pct != null ? `卸载率 ${format(device.unload_rate_pct, 2)}%` : "状态数据不足"} tone="green" /><MetricTile icon="E" label="系统比功率" value={format(specific?.average_kw_per_m3_min, 3)} unit="kW/(m³/min)" note="功率与流量时间对齐" /><MetricTile icon="T" label="排气温度" value={format(realtime?.discharge_temperature_c, 1)} unit="°C" note={realtime?.loaded == null ? "负载状态待获取" : realtime.loaded ? "当前加载运行" : "当前卸载运行"} tone="amber" /></div>
+    <section className="compressor-flow"><div className="air-machine"><i>1#</i><strong>{realtime?.running ? "运行" : realtime?.running === false ? "停机" : "未知"}</strong><span>{format(device?.load_rate_pct, 1)}% 加载率</span></div><div className="air-line"><i /><i /><i /><i /><i /></div><div className="air-tank"><span>储气</span></div><div className="air-header"><strong>供气母管</strong><span>{format(realtime?.supply_pressure_mpa, 3)} MPa</span></div></section>
+  </div><InsightList title="空压异常与节能筛查" warnings={analysis?.warnings} empty="当前已执行的空压工具未产生异常提醒；结论仅覆盖已执行能力。" /></div>;
+}
+
+function CarbonWorkspace({ summary, onAsk }: { summary?: DailySummary; onAsk: (prompt: string) => void }) {
+  return <div className="domain-workspace"><div className="domain-main"><div className="domain-heading"><div><p>CARBON DATA READINESS</p><h2>碳减排数据准备</h2></div><button onClick={() => onAsk("当前项目是否具备计算碳排放和减排量的数据条件？")}>询问 AI</button></div>
+    <section className="carbon-empty"><i>CO₂</i><div><h3>尚未接入可审计的碳排因子与产量基线</h3><p>当前平台可以提供电量、空压节能筛查与每日摘要，但不能把这些数据直接换算成正式碳排放或减排量。接入电网排放因子、核算边界、产量和基准期后，才能形成可核验结果。</p></div></section>
+    {summary && <section className="latest-brief"><div className="section-head"><div><p>最近摘要</p><h3>{summary.title}</h3></div><span>{summary.summary_date}</span></div><Markdown text={summary.content} /></section>}
+  </div><InsightList title="碳核算缺口" warnings={[{ severity: "medium", message: "碳排因子、组织边界、产量基线和核算标准尚未形成统一数据契约。" }]} empty="" /></div>;
+}
+
+function EventsWorkspace({ snapshots, onAsk }: { snapshots: DeviceSnapshot[]; onAsk: (prompt: string) => void }) {
+  const events = snapshots.flatMap(snapshot => snapshot.alarms.map(alarm => ({ ...alarm, deviceName: snapshot.device.name })));
+  return <div className="events-workspace"><div className="domain-heading"><div><p>INTELLIGENT EVENT LOOP</p><h2>智能事件与证据</h2></div><button onClick={() => onAsk("解释当前活动告警，并按优先级给出处置建议")}>询问事件专家</button></div>
+    <div className="event-stats"><MetricTile icon="AI" label="今日发现事件" value={String(events.length)} unit="项" note="来自统一告警接口" /><MetricTile icon="!" label="高优先级" value={String(events.filter(event => ["CRITICAL", "MAJOR"].includes(event.severity)).length)} unit="项" note="需人工确认" tone="amber" /><MetricTile icon="✓" label="数据设备" value={String(snapshots.length)} unit="台" note="当前分析范围" tone="green" /></div>
+    <section className="event-list"><div className="section-head"><div><p>实时事件流</p><h3>ThingsBoard 告警证据</h3></div><span>{events.length} 项</span></div>{events.length ? events.map((event, index) => <article key={`${event.created_time}-${index}`}><i>{event.severity.slice(0, 1)}</i><div><strong>{event.type}</strong><span>{event.deviceName} · {event.status}</span></div><time>{new Date(event.created_time).toLocaleString("zh-CN")}</time></article>) : <div className="chart-empty">当前设备范围没有活动告警</div>}</section>
+  </div>;
+}
+
+const workspaceLabels: Record<Workspace, string> = {
+  overview: "能源总览", demand: "需量管理", quality: "电能质量",
+  compressor: "空压系统", carbon: "碳减排", events: "智能事件",
+};
+
+const assistantSuggestions: Record<Workspace, Array<{ tag: string; text: string }>> = {
+  overview: [
+    { tag: "运行概览", text: "概括当前能源运行情况，只回答关键指标和异常" },
+    { tag: "需量风险", text: "当前是否存在需量超限风险？" },
+    { tag: "异常定位", text: "今天有哪些用能异常需要关注？" },
+    { tag: "设备状态", text: "哪些设备当前需要优先关注？" },
+  ],
+  demand: [
+    { tag: "需量风险", text: "分析当前15分钟最大需量和申报需量风险" },
+    { tag: "峰均比", text: "当前负荷峰均比是否异常？" },
+    { tag: "峰值", text: "过去24小时负荷峰值发生在什么时候？" },
+    { tag: "依据", text: "解释需量判断使用的数据口径" },
+  ],
+  quality: [
+    { tag: "综合判断", text: "当前谐波与功率因数是否正常？" },
+    { tag: "功率因数", text: "分析当前功率因数及历史最低值" },
+    { tag: "三相不平衡", text: "当前三相电流不平衡是否需要关注？" },
+    { tag: "谐波", text: "说明当前THD监测结果与依据" },
+  ],
+  compressor: [
+    { tag: "运行效率", text: "空压系统今天是否存在低效运行？" },
+    { tag: "加载卸载", text: "分析空压机加载率和卸载率" },
+    { tag: "压力", text: "供气压力波动是否异常？" },
+    { tag: "节能", text: "筛查当前空压系统节能机会" },
+  ],
+  carbon: [
+    { tag: "数据条件", text: "当前是否具备计算碳排放的数据条件？" },
+    { tag: "核算边界", text: "碳核算还缺少哪些基础数据？" },
+    { tag: "能耗依据", text: "总结当前可用于碳核算的能源数据" },
+    { tag: "口径", text: "正式计算减排量需要哪些口径？" },
+  ],
+  events: [
+    { tag: "异常定位", text: "今天有哪些用能异常需要关注？" },
+    { tag: "优先级", text: "按优先级解释当前活动告警" },
+    { tag: "影响", text: "当前告警可能影响哪些设备？" },
+    { tag: "依据", text: "展开当前异常的监测依据" },
+  ],
+};
+
+function Assistant({ token, deviceIds, open, prompt, workspace, onOpenChange }: { token: string; deviceIds: string[]; open: boolean; prompt: string; workspace: Workspace; onOpenChange: (open: boolean) => void }) {
+  const [threadId, setThreadId] = useState(() => `assistant-${crypto.randomUUID()}`);
+  const [input, setInput] = useState("");
+  const [messages, setMessages] = useState<AssistantMessage[]>([]);
+  const [tools, setTools] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState("理解问题");
+  const [lastQuestion, setLastQuestion] = useState("");
+  const [copiedId, setCopiedId] = useState("");
+  const [feedback, setFeedback] = useState<Record<string, "up" | "down">>({});
+  const controllerRef = useRef<AbortController | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const previousWorkspace = useRef(workspace);
+  const suggestions = assistantSuggestions[workspace];
+
+  useEffect(() => { if (prompt) setInput(prompt.slice(0, 500)); }, [prompt]);
+  useEffect(() => { if (open) window.setTimeout(() => inputRef.current?.focus(), 80); }, [open]);
+  useEffect(() => {
+    if (previousWorkspace.current === workspace) return;
+    controllerRef.current?.abort();
+    setBusy(false); setMessages([]); setTools([]); setInput("");
+    setThreadId(`assistant-${crypto.randomUUID()}`);
+    previousWorkspace.current = workspace;
+  }, [workspace]);
+  useEffect(() => () => controllerRef.current?.abort(), []);
+
+  function close() {
+    if (busy) controllerRef.current?.abort();
+    onOpenChange(false);
+  }
+
+  function stopGeneration() {
+    controllerRef.current?.abort();
+    setBusy(false);
+    setMessages(current => current.map(message => message.id === "streaming" ? { ...message, id: crypto.randomUUID(), stopped: true, text: message.text || "生成已停止。" } : message));
+  }
+
+  async function submit(questionValue: string) {
+    const question = questionValue.trim();
+    if (!question || busy || question.length > 500) return;
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    setInput(""); setTools([]); setBusy(true); setProgress("理解问题"); setLastQuestion(question);
+    setMessages(current => [...current, { id: crypto.randomUUID(), who: "you", text: question }, { id: "streaming", who: "ai", text: "" }]);
+    let answer = "";
+    let hasError = false;
+    try {
+      await streamChat(token, {
+        request_id: crypto.randomUUID(), thread_id: threadId, message: question,
+        device_scope: deviceIds, page_context: { selected_device_ids: deviceIds },
+      }, (event: ChatStreamEvent) => {
+        if (event.event === "node") setProgress("查询指标");
+        if (event.event === "tool") {
+          setProgress("查询指标");
+          const name = String(event.content?.tool_name || "");
+          const label = toolLabels[name] || name;
+          if (label) setTools(current => current.includes(label) ? current : [...current, label]);
+        }
+        if (event.event === "message") {
+          setProgress("组织答案");
+          answer = String(event.content?.message || "");
+          setMessages(current => current.map(message => message.id === "streaming" ? { ...message, text: answer } : message));
+        }
+        if (event.event === "error") {
+          hasError = true;
+          answer = String(event.content?.message || "AI 服务暂时不可用");
+        }
+      }, controller.signal);
+      setMessages(current => current.map(message => message.id === "streaming" ? { ...message, id: crypto.randomUUID(), text: answer || "分析完成，但没有返回可展示内容。", errorCode: hasError ? "AI-504" : undefined } : message));
+    } catch (reason) {
+      if (controller.signal.aborted) return;
+      const offline = typeof navigator !== "undefined" && !navigator.onLine;
+      setMessages(current => current.map(message => message.id === "streaming" ? {
+        ...message, id: crypto.randomUUID(), errorCode: offline ? "NET-OFFLINE" : "AI-504",
+        text: offline ? "网络已断开，问题尚未完成。请恢复连接后重试。" : "AI 服务暂时无法生成答案。你的问题已保留，可稍后重试。",
+      } : message));
+    } finally {
+      if (!controller.signal.aborted) setBusy(false);
+      controllerRef.current = null;
+    }
+  }
+
+  function send(event: FormEvent) { event.preventDefault(); void submit(input); }
+  function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(input); }
+    if (event.key === "Escape") close();
+  }
+  async function copyAnswer(message: AssistantMessage) {
+    await navigator.clipboard.writeText(message.text);
+    setCopiedId(message.id); window.setTimeout(() => setCopiedId(""), 1500);
+  }
+
+  return <>
+    <button className={`assistant-fab ${open ? "active" : ""}`} onClick={() => open ? close() : onOpenChange(true)} aria-label={open ? "关闭 AI 助手" : "打开 AI 助手"}><i>AI</i><span>AI 助手</span><b>{open ? "×" : ">"}</b></button>
+    {open && <div className="assistant-overlay" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}>
+      <section className="assistant-drawer" role="dialog" aria-modal="true" aria-labelledby="assistant-title">
+        <header><div><span><strong id="assistant-title">Aethra AI 助手</strong><small><i />当前工厂 · {workspaceLabels[workspace]} · {deviceIds.length} 台设备</small></span></div><div className="assistant-window-actions"><button type="button" onClick={() => onOpenChange(false)} aria-label="最小化 AI 助手">−</button><button type="button" onClick={close} aria-label="关闭 AI 助手">×</button></div></header>
+        <div className="assistant-messages">
+          {!messages.length && <div className="assistant-welcome"><i>AI</i><div><h3>你好，我是 Aethra</h3><p>我可以基于当前页面和已授权设备数据，回答能耗、需量、电能质量、空压及碳数据问题。</p></div></div>}
+          {!messages.length && <div className="assistant-suggestions"><p>你可以这样问</p>{suggestions.map(item => <button type="button" key={item.text} onClick={() => void submit(item.text)}><span>{item.tag}</span><strong>{item.text}</strong><b aria-hidden="true">›</b></button>)}</div>}
+          {messages.map(message => <article className={`assistant-message ${message.who} ${message.errorCode ? "error" : ""}`} key={message.id}>
+            {message.errorCode ? <div className="assistant-error"><i>!</i><h3>暂时无法生成答案</h3><p>{message.text}</p><button type="button" onClick={() => void submit(lastQuestion)} disabled={busy}>重新生成</button><small>错误码：{message.errorCode}</small></div> : <><div className="message-meta"><strong>{message.who === "ai" ? "Aethra AI" : "你"}</strong><time>{new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time></div><Markdown text={message.text || "正在组织答案…"} />{message.stopped && <div className="assistant-notice">已停止生成，已完成内容仍可查看。</div>}{message.who === "ai" && message.text && !message.stopped && <div className="message-actions"><button type="button" onClick={() => void copyAnswer(message)}>{copiedId === message.id ? "已复制" : "复制"}</button><button type="button" className={feedback[message.id] === "up" ? "selected" : ""} onClick={() => setFeedback(current => ({ ...current, [message.id]: "up" }))} aria-label="回答有帮助">有帮助</button><button type="button" className={feedback[message.id] === "down" ? "selected" : ""} onClick={() => setFeedback(current => ({ ...current, [message.id]: "down" }))} aria-label="回答需改进">需改进</button></div>}</>}
+          </article>)}
+          {tools.length > 0 && <div className="assistant-evidence"><span>依据</span>{tools.map(tool => <b key={tool}>{tool}</b>)}<b>{deviceIds.length} 台设备范围</b></div>}
+          {busy && <div className="assistant-generation"><strong>正在生成答案</strong><ol><li className="done">理解问题</li><li className={progress !== "理解问题" ? "done" : "active"}>查询指标</li><li className={progress === "组织答案" ? "active" : ""}>组织答案</li></ol><button type="button" onClick={stopGeneration}>停止生成</button></div>}
+          {!busy && messages.some(message => message.who === "ai" && !message.errorCode) && <div className="assistant-followups"><span>继续追问</span>{suggestions.slice(0, 3).map(item => <button type="button" key={item.text} onClick={() => void submit(item.text)}>{item.tag}</button>)}</div>}
+        </div>
+        <form className="assistant-composer" onSubmit={send}><textarea ref={inputRef} value={input} maxLength={500} disabled={busy} onKeyDown={handleKeyDown} onChange={event => setInput(event.target.value.slice(0, 500))} placeholder={busy ? "当前状态不可提问" : "输入你的能碳问题"} aria-label="输入你的能碳问题" /><div><span className={input.length >= 480 ? "limit" : ""}>{input.length}/500</span><small>Enter 发送 · Shift+Enter 换行</small></div><button disabled={busy || !input.trim()} aria-label="发送问题">↑</button></form>
+      </section>
+    </div>}
+  </>;
+}
+
+export default function App() {
+  const [token, setToken] = useState(() => localStorage.getItem("arthra_token") || "");
+  const [user, setUser] = useState<User | null>(null);
+  const [workspace, setWorkspace] = useState<Workspace>("overview");
+  const [assistantOpen, setAssistantOpen] = useState(false);
+  const [assistantPrompt, setAssistantPrompt] = useState("");
+  const [clock, setClock] = useState(new Date());
+  const data = useOperationsData(token);
+  useEffect(() => {
+    if (!token) return;
+    api<User>("/auth/me", token).then(setUser).catch(() => { localStorage.removeItem("arthra_token"); setToken(""); });
+  }, [token]);
+  useEffect(() => { const timer = window.setInterval(() => setClock(new Date()), 30_000); return () => window.clearInterval(timer); }, []);
+  const meter = data.snapshots.find(row => row.device.type === "meter");
+  const history = seriesOf(meter?.history, "meter_TotW");
+  const latestSummary = data.summaries[0];
+  function ask(prompt: string) { setAssistantPrompt(prompt); setAssistantOpen(true); }
+  function login(value: string) { localStorage.setItem("arthra_token", value); setToken(value); }
+  if (!token) return <Login onLogin={login} />;
+  return <div className="control-room">
+    <header className="topbar"><div className="vista-brand"><strong>AethraVista<sup>TM</sup></strong><span>AI 能碳运营管理平台</span></div><div className="top-status"><span>{user?.role === "admin" ? "管理员" : "能源用户"}</span><time>数据更新 {clock.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time><i className={data.error ? "offline" : ""} /><button onClick={() => { localStorage.removeItem("arthra_token"); setToken(""); }}>退出</button></div></header>
+    {data.error && <div className="global-error">{data.error}</div>}
+    <div className="dashboard-shell">
+      <InsightRail workspace={workspace} summary={latestSummary} snapshots={data.snapshots} powerAnalysis={data.powerAnalysis} compressorAnalysis={data.compressorAnalysis} summaryBusy={data.summaryBusy} onRefresh={data.refreshSummary} onAsk={ask} />
+      <main className="main-stage">
+        {data.loading && !data.snapshots.length && <div className="stage-loading"><i /><span>正在连接统一工业数据服务</span></div>}
+        {workspace === "overview" && <Overview snapshots={data.snapshots} powerAnalysis={data.powerAnalysis} compressorAnalysis={data.compressorAnalysis} />}
+        {workspace === "demand" && <DemandWorkspace analysis={data.powerAnalysis} history={history} onAsk={ask} />}
+        {workspace === "quality" && <QualityWorkspace analysis={data.powerAnalysis} onAsk={ask} />}
+        {workspace === "compressor" && <CompressorWorkspace analysis={data.compressorAnalysis} onAsk={ask} />}
+        {workspace === "carbon" && <CarbonWorkspace summary={latestSummary} onAsk={ask} />}
+        {workspace === "events" && <EventsWorkspace snapshots={data.snapshots} onAsk={ask} />}
+      </main>
+    </div>
+    <nav className="bottom-nav">{navItems.map(item => <button key={item.id} className={workspace === item.id ? "active" : ""} onClick={() => setWorkspace(item.id)}><i>{item.icon}</i><span>{item.label}</span></button>)}</nav>
+    <Assistant token={token} deviceIds={data.devices.map(device => device.id.id)} open={assistantOpen} prompt={assistantPrompt} workspace={workspace} onOpenChange={setAssistantOpen} />
+  </div>;
 }

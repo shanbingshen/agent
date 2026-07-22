@@ -1,10 +1,11 @@
 import pytest
 from arthra.agent import SemanticRouteOutput
-from arthra.api import sse
+from arthra.api import sse, tool_event_content
 from arthra.compressor.schemas import CompressorAnalysisRequest
 from arthra.main import app
 from arthra.schemas import ChatRequest, ControlPlanCreate
 from arthra.thingsboard_schemas import TelemetryHistory
+from langchain_core.messages import ToolMessage
 from pydantic import ValidationError
 
 
@@ -85,3 +86,21 @@ def test_sse_payload_is_validated_by_event_contract():
     assert '"event": "node"' in event
     with pytest.raises(ValidationError):
         sse("invented_event", {}, None)
+
+
+def test_tool_sse_only_exposes_execution_summary():
+    message = ToolMessage(
+        content=(
+            '{"capabilities":["load_rate"],"data_status":"available",'
+            '"warnings":[],"missing_metrics":[]}'
+        ),
+        name="analyze_compressor_load_unload_rate",
+        tool_call_id="call-1",
+    )
+
+    content = tool_event_content(message)
+
+    assert content["tool_name"] == "analyze_compressor_load_unload_rate"
+    assert content["capabilities"] == ["load_rate"]
+    assert content["warning_count"] == 0
+    assert "metrics" not in content

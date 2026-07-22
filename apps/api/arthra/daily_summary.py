@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from arthra.agent_schemas import DeviceContext
 from arthra.agent_tools import analyze_device_context, flatten_latest_telemetry
 from arthra.config import Settings, get_settings
-from arthra.contracts import AttributeValues, JsonObject
+from arthra.contracts import AnalysisWarning, AttributeValues, JsonObject
 from arthra.daily_schemas import (
     DailyAlarm,
     DailyDeviceStatistics,
@@ -22,9 +22,15 @@ from arthra.daily_schemas import (
     HistoryMetric,
 )
 from arthra.db import SessionLocal
+from arthra.industrial_data import IndustrialDataError, IndustrialDataService
+from arthra.industrial_data.factory import get_industrial_data_service
+from arthra.industrial_data.ports import IndustrialDataAdapter
+from arthra.industrial_data.schemas import (
+    IndustrialAlarmPage,
+    IndustrialDevicePage,
+    IndustrialTelemetryHistory,
+)
 from arthra.models import AuditEvent, DailySummary
-from arthra.thingsboard import ThingsBoardClient, ThingsBoardError
-from arthra.thingsboard_schemas import AlarmPage, DevicePage, TelemetryHistory
 
 SUPPORTED_DEVICE_TYPES = {"ems", "meter", "compressor"}
 logger = logging.getLogger(__name__)
@@ -48,10 +54,15 @@ HISTORY_KEYS: dict[str, list[str]] = {
         "air_comp_supply_pressure",
         "air_comp_discharge_temp",
         "air_comp_main_current_a",
+        "air_comp_fad_flow_m3_min",
         "air_comp_running_hours",
         "air_comp_loading_hours",
     ],
 }
+
+HISTORY_INTERVAL_MS = 300_000
+ENERGY_POWER_RATIO_MIN = 0.5
+ENERGY_POWER_RATIO_MAX = 1.5
 
 
 class DailySummaryError(RuntimeError):
@@ -68,10 +79,10 @@ def _number(value: Any) -> float | None:
 
 
 def history_statistics(
-    payload: TelemetryHistory | dict[str, Any],
+    payload: IndustrialTelemetryHistory | dict[str, Any],
 ) -> dict[str, HistoryMetric]:
-    """Reduce a ThingsBoard history payload to reproducible numeric statistics."""
-    history = TelemetryHistory.model_validate(payload)
+    """Reduce unified industrial history to reproducible numeric statistics."""
+    history = IndustrialTelemetryHistory.model_validate(payload)
     statistics: dict[str, HistoryMetric] = {}
     for key, raw_samples in history.items():
         samples: list[tuple[int, float]] = []
@@ -91,15 +102,46 @@ def history_statistics(
             "max": round(max(values), 4),
             "avg": round(sum(values) / len(values), 4),
             "delta": round(values[-1] - values[0], 4),
+            "first_ts": samples[0][0],
+            "latest_ts": samples[-1][0],
+            "observed_hours": round((samples[-1][0] - samples[0][0]) / 3_600_000, 4),
         })
     return statistics
 
 
+def _history_coverage(metric: HistoryMetric, period_start: datetime, period_end: datetime) -> float:
+    expected = max(
+        1,
+        round((period_end - period_start).total_seconds() * 1000 / HISTORY_INTERVAL_MS),
+    )
+    return min(1.0, metric.samples / expected)
+
+
+def _validated_energy_delta(
+    energy: HistoryMetric,
+    power: HistoryMetric | None,
+) -> tuple[float | None, str | None]:
+    if energy.delta < 0:
+        return None, "累计电量计数器在查询窗口内发生回退或复位"
+    if power is None or energy.observed_hours is None or energy.observed_hours < 0.25:
+        return None, "缺少足够的有功功率或累计电量观测时长，无法交叉校验用电增量"
+    expected_from_power = power.avg * energy.observed_hours
+    if expected_from_power <= 0:
+        return None, "有功功率积分结果无效，无法交叉校验用电增量"
+    ratio = energy.delta / expected_from_power
+    if not ENERGY_POWER_RATIO_MIN <= ratio <= ENERGY_POWER_RATIO_MAX:
+        return None, (
+            f"累计电量差值 {energy.delta:.3f} kWh 与功率积分估算 "
+            f"{expected_from_power:.3f} kWh 不一致（比值 {ratio:.2f}）"
+        )
+    return energy.delta, None
+
+
 def _recent_alarms(
-    payload: AlarmPage | dict[str, Any], start_ms: int, end_ms: int
+    payload: IndustrialAlarmPage | dict[str, Any], start_ms: int, end_ms: int
 ) -> list[DailyAlarm]:
     alarms: list[DailyAlarm] = []
-    for alarm in AlarmPage.model_validate(payload).data:
+    for alarm in IndustrialAlarmPage.model_validate(payload).data:
         created = alarm.created_time
         if not start_ms <= created <= end_ms:
             continue
@@ -115,12 +157,14 @@ def _recent_alarms(
 
 
 def collect_daily_snapshot(
-    client: ThingsBoardClient,
+    client: IndustrialDataAdapter | IndustrialDataService,
     device_scope: list[str],
     period_start: datetime,
     period_end: datetime,
 ) -> DailySnapshot:
-    page = DevicePage.model_validate(client.list_devices(page=0, page_size=1000))
+    page = IndustrialDevicePage.model_validate(
+        client.list_devices(page=0, page_size=1000)
+    )
     all_devices = page.data
     metadata = {item.id.id: item for item in all_devices}
     selected_ids = list(dict.fromkeys(device_scope)) if device_scope else [
@@ -188,7 +232,7 @@ def collect_daily_snapshot(
                 alarm.model_copy(update={"device_id": device_id, "device_name": context.name})
                 for alarm in alarms
             )
-        except ThingsBoardError as exc:
+        except IndustrialDataError as exc:
             contexts.append(DeviceContext(
                 id=device_id,
                 name=device.name,
@@ -198,27 +242,71 @@ def collect_daily_snapshot(
 
     analysis = analyze_device_context("report", contexts, "AI 每日能源运行摘要")
     meter_power_averages: list[float] = []
+    meter_power_coverages: list[float] = []
     energy_deltas: list[float] = []
+    integrity_warnings: list[AnalysisWarning] = []
+    integrity_missing: list[str] = []
     for device in device_statistics:
         metrics = device["metrics"]
-        if "meter_TotW" in metrics:
-            meter_power_averages.append(float(metrics["meter_TotW"]["avg"]))
-        if "meter_SupWh" in metrics:
-            energy_deltas.append(max(0.0, float(metrics["meter_SupWh"]["delta"])))
+        power_metric = metrics.get("meter_TotW")
+        energy_metric = metrics.get("meter_SupWh")
+        if power_metric is not None:
+            meter_power_averages.append(float(power_metric.avg))
+            meter_power_coverages.append(
+                _history_coverage(power_metric, period_start, period_end)
+            )
+        if energy_metric is not None:
+            energy_delta, validation_error = _validated_energy_delta(
+                energy_metric, power_metric
+            )
+            if energy_delta is not None:
+                energy_deltas.append(energy_delta)
+            elif validation_error:
+                message = f"{device.device_name}: {validation_error}"
+                integrity_missing.append(message)
+                integrity_warnings.append(
+                    AnalysisWarning(
+                        severity="high",
+                        code="INVALID_ENERGY_COUNTER_DELTA",
+                        device_id=device.device_id,
+                        device_name=device.device_name,
+                        metric="meter_SupWh",
+                        message=message,
+                        evidence={
+                            "counter_delta_kwh": energy_metric.delta,
+                            "average_power_kw": power_metric.avg if power_metric else None,
+                            "observed_hours": energy_metric.observed_hours,
+                        },
+                    )
+                )
+
+    snapshot_warnings = [*analysis.warnings, *integrity_warnings]
+    if energy_deltas and integrity_warnings:
+        energy_status = "partial"
+    elif energy_deltas:
+        energy_status = "available"
+    elif integrity_warnings:
+        energy_status = "invalid"
+    else:
+        energy_status = "unavailable"
 
     return DailySnapshot(
         overview=DailyOverview(**{
             "device_count": len(selected_ids),
             "available_device_count": len(device_statistics),
-            "warning_count": len(analysis["warnings"]),
+            "warning_count": len(snapshot_warnings),
             "alarm_count": len(all_alarms),
             "average_active_power_kw": round(sum(meter_power_averages) / len(meter_power_averages), 3) if meter_power_averages else None,
+            "active_power_data_coverage": round(
+                sum(meter_power_coverages) / len(meter_power_coverages), 4
+            ) if meter_power_coverages else None,
             "energy_consumption_kwh": round(sum(energy_deltas), 3) if energy_deltas else None,
+            "energy_consumption_status": energy_status,
         }),
         devices=device_statistics,
         findings=analysis.findings,
-        missing_metrics=analysis.missing_metrics,
-        warnings=analysis.warnings,
+        missing_metrics=[*analysis.missing_metrics, *integrity_missing],
+        warnings=snapshot_warnings,
         thingsboard_alarms=all_alarms,
     )
 
@@ -234,9 +322,16 @@ def deterministic_summary(title: str, snapshot: DailySnapshot) -> str:
         f"- ThingsBoard 告警：{overview['alarm_count']} 条",
     ]
     if overview.get("average_active_power_kw") is not None:
-        lines.append(f"- 24 小时平均有功功率：{overview['average_active_power_kw']:.3f} kW")
+        coverage = overview.get("active_power_data_coverage")
+        coverage_text = f"，数据覆盖率 {coverage:.1%}" if coverage is not None else ""
+        lines.append(
+            f"- 查询窗口已有样本平均有功功率：{overview['average_active_power_kw']:.3f} kW"
+            f"{coverage_text}"
+        )
     if overview.get("energy_consumption_kwh") is not None:
         lines.append(f"- 查询窗口内可用数据用电增量：{overview['energy_consumption_kwh']:.3f} kWh")
+    elif overview.get("energy_consumption_status") == "invalid":
+        lines.append("- 查询窗口用电增量：累计表计与功率积分不一致，已拒绝输出错误电量")
     lines.extend(["", "## 当前关键读数"])
     lines.extend(f"- {finding}" for finding in snapshot["findings"][:20])
     if not snapshot["findings"]:
@@ -269,7 +364,11 @@ def _synthesize_with_llm(title: str, snapshot: DailySnapshot, settings: Settings
             "结构必须包含：运行概况、能源与电能质量、空压机状态、风险提醒、今日建议。",
             "若数据缺失要明确说明；若建议涉及控制，只能建议创建待审批计划，不能声称已经执行。",
             "energy_consumption_kwh 是最近 24 小时查询窗口内已有数据的电量增量；不要声称数据一定完整覆盖 24 小时。",
+            "energy_consumption_status 不是 available/partial 时，不得输出或估算用电增量。",
+            "average_active_power_kw 只是已有历史样本均值，必须同时说明 active_power_data_coverage。",
             "devices.metrics 中 latest 是当前实时值，latest_bucket_avg 是最后一个 5 分钟历史桶均值；不要混淆二者。",
+            "所有异常判断必须来自 warnings；所有数据缺失判断必须逐字来自 missing_metrics。",
+            "不得自行新增阈值、告警、缺失指标或设备关联关系，也不得把低于阈值的指标描述为偏高。",
             f"标题：{title}",
             "24 小时确定性统计：",
             json.dumps(snapshot.model_dump(mode="json"), ensure_ascii=False),
@@ -285,7 +384,7 @@ def generate_daily_summary(
     generated_by: uuid.UUID | None,
     trigger: str = "manual",
     now: datetime | None = None,
-    client: ThingsBoardClient | None = None,
+    client: IndustrialDataAdapter | IndustrialDataService | None = None,
     settings: Settings | None = None,
 ) -> DailySummary:
     settings = settings or get_settings()
@@ -296,7 +395,10 @@ def generate_daily_summary(
     local_date = period_end.astimezone(ZoneInfo(settings.daily_summary_timezone)).date()
     title = f"Arthra AI 每日摘要 · {local_date.isoformat()}"
     snapshot = collect_daily_snapshot(
-        client or ThingsBoardClient(settings=settings), device_scope, period_start, period_end
+        client or get_industrial_data_service(),
+        device_scope,
+        period_start,
+        period_end,
     )
     status = "deterministic"
     model_name = "deterministic-fallback"

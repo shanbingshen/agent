@@ -11,9 +11,11 @@ from arthra.contracts import (
     TelemetryValues,
     TimestampValues,
 )
-from arthra.thingsboard_schemas import AlarmInfo
+from arthra.industrial_data.schemas import IndustrialAlarm
 
 type CompressorCapability = Literal[
+    "realtime_status",
+    "energy_consumption",
     "load_rate",
     "idle_running",
     "frequent_start",
@@ -24,6 +26,11 @@ type CompressorCapability = Literal[
     "leakage",
     "savings",
     "verification",
+]
+
+type LoadUnloadCalculationMethod = Literal[
+    "aligned-state-ratio",
+    "cumulative-hours-delta",
 ]
 
 
@@ -51,6 +58,47 @@ class CompressorAnalysisRequest(StrictModel):
         return self
 
 
+class LoadUnloadRateToolInput(StrictModel):
+    device_scope: list[str] = Field(min_length=1, max_length=100)
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    interval_seconds: int = Field(default=180, ge=30, le=3600)
+
+    @model_validator(mode="after")
+    def validate_window(self) -> "LoadUnloadRateToolInput":
+        end = self.end_at or datetime.now(UTC)
+        start = self.start_at or end - timedelta(hours=24)
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ValueError("start_at 和 end_at 必须包含时区")
+        if start >= end:
+            raise ValueError("start_at 必须早于 end_at")
+        if end - start > timedelta(days=31):
+            raise ValueError("单次分析时间窗口不能超过31天")
+        object.__setattr__(self, "start_at", start.astimezone(UTC))
+        object.__setattr__(self, "end_at", end.astimezone(UTC))
+        return self
+
+
+class IdleRunningToolInput(LoadUnloadRateToolInput):
+    pass
+
+
+class FrequentStartToolInput(LoadUnloadRateToolInput):
+    pass
+
+
+class PressureFluctuationToolInput(LoadUnloadRateToolInput):
+    pass
+
+
+class HighSupplyPressureToolInput(LoadUnloadRateToolInput):
+    pass
+
+
+class SpecificPowerToolInput(LoadUnloadRateToolInput):
+    pass
+
+
 class SignalPoint(StrictModel):
     ts: int = Field(ge=0)
     value: float
@@ -71,7 +119,7 @@ class AirSystemDevice(StrictModel):
     latest: TelemetryValues = Field(default_factory=lambda: TelemetryValues({}))
     latest_timestamps: TimestampValues = Field(default_factory=lambda: TimestampValues({}))
     signals: dict[str, SignalSeries] = Field(default_factory=dict)
-    alarms: list[AlarmInfo] = Field(default_factory=list)
+    alarms: list[IndustrialAlarm] = Field(default_factory=list)
 
 
 class DataQuality(StrictModel):
@@ -125,10 +173,65 @@ class CompressorDeviceMetrics(StrictModel):
     device_name: str
     load_rate_pct: float | None = Field(default=None, ge=0, le=100)
     unload_rate_pct: float | None = Field(default=None, ge=0, le=100)
+    load_unload_method: LoadUnloadCalculationMethod | None = None
+    aligned_sample_count: int | None = Field(default=None, ge=0)
+    running_minutes: float | None = Field(default=None, ge=0)
+    loaded_minutes: float | None = Field(default=None, ge=0)
+    unloaded_minutes: float | None = Field(default=None, ge=0)
+    sample_coverage: float | None = Field(default=None, ge=0, le=1)
     idle_running_minutes: float | None = Field(default=None, ge=0)
     longest_idle_running_minutes: float | None = Field(default=None, ge=0)
     start_count: int | None = Field(default=None, ge=0)
+    start_observation_hours: float | None = Field(default=None, ge=0)
     starts_per_hour: float | None = Field(default=None, ge=0)
+
+
+class CompressorRealtimeMetrics(StrictModel):
+    device_name: str
+    running: bool | None = None
+    loaded: bool | None = None
+    supply_pressure_mpa: float | None = Field(default=None, ge=0)
+    discharge_temperature_c: float | None = None
+    linked_power_kw: float | None = Field(default=None, ge=0)
+    active_alarm_count: int = Field(default=0, ge=0)
+    data_timestamp: int | None = Field(default=None, ge=0)
+
+
+class CompressorEnergyMetrics(StrictModel):
+    meter_name: str
+    start_reading_kwh: float = Field(ge=0)
+    end_reading_kwh: float = Field(ge=0)
+    consumption_kwh: float = Field(ge=0)
+    calculation_method: Literal["cumulative-register-delta"] = "cumulative-register-delta"
+
+
+class LoadUnloadRateDeviceResult(StrictModel):
+    device_id: str
+    device_name: str
+    data_status: Literal["available", "unavailable"]
+    calculation_method: LoadUnloadCalculationMethod | None = None
+    load_rate_pct: float | None = Field(default=None, ge=0, le=100)
+    unload_rate_pct: float | None = Field(default=None, ge=0, le=100)
+    aligned_sample_count: int = Field(default=0, ge=0)
+    running_minutes: float | None = Field(default=None, ge=0)
+    loaded_minutes: float | None = Field(default=None, ge=0)
+    unloaded_minutes: float | None = Field(default=None, ge=0)
+    sample_coverage: float = Field(default=0, ge=0, le=1)
+    unload_warning_threshold_pct: float = Field(ge=0, le=100)
+    exceeds_unload_warning_threshold: bool = False
+    missing_metrics: list[str] = Field(default_factory=list)
+
+
+class LoadUnloadRateToolResult(StrictModel):
+    capability: Literal["load_rate"] = "load_rate"
+    air_system_id: str
+    start_ts: int = Field(ge=0)
+    end_ts: int = Field(ge=0)
+    interval_seconds: int = Field(ge=30, le=3600)
+    data_status: Literal["available", "partial", "unavailable"]
+    devices: list[LoadUnloadRateDeviceResult]
+    warnings: list[AnalysisWarning] = Field(default_factory=list)
+    missing_metrics: list[str] = Field(default_factory=list)
 
 
 class PressureMetrics(StrictModel):
@@ -178,6 +281,8 @@ class SavingsMetrics(StrictModel):
 
 
 class CompressorMetrics(StrictModel):
+    realtime: dict[str, CompressorRealtimeMetrics] = Field(default_factory=dict)
+    energy: CompressorEnergyMetrics | None = None
     devices: dict[str, CompressorDeviceMetrics] = Field(default_factory=dict)
     pressure: dict[str, PressureMetrics] = Field(default_factory=dict)
     specific_power: SpecificPowerMetrics | None = None

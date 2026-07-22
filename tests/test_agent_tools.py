@@ -115,4 +115,5 @@ def test_adl400_power_quality_analysis():
     assert analysis["data_status"] == "available"
     assert any("120.50 kW" in finding for finding in analysis["findings"])
     assert any("最大电压 THD 2.200%" in finding for finding in analysis["findings"])
+    assert not any("138.000 kW" in finding for finding in analysis["findings"])
     assert analysis["warnings"] == []

@@ -1,6 +1,8 @@
 from collections.abc import Iterable
 
 CAPABILITY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "realtime_status": ("当前状态", "现在运行", "运行正常", "实时状态", "realtime status"),
+    "energy_consumption": ("耗电量", "用了多少电", "用电量", "energy consumption"),
     "load_rate": ("加载率", "卸载率", "加载", "卸载", "load rate"),
     "idle_running": ("空载", "空转", "卸载运行", "idle"),
     "frequent_start": ("频繁启停", "启停", "启动次数", "start"),
@@ -13,16 +15,21 @@ CAPABILITY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "verification": ("优化前后", "效果验证", "基线", "verification"),
 }
 
-DEFAULT_CAPABILITIES = [
-    "load_rate",
-    "idle_running",
-    "frequent_start",
-    "pressure_fluctuation",
-    "high_pressure",
-    "specific_power",
-]
+DEFAULT_CAPABILITIES = ["realtime_status"]
 
 CAPABILITY_KEYS: dict[str, dict[str, set[str]]] = {
+    "realtime_status": {
+        "compressor": {
+            "air_comp_running_flag",
+            "air_comp_loaded_flag",
+            "air_comp_supply_pressure",
+            "air_comp_discharge_temp",
+        },
+        "meter": {"meter_TotW"},
+    },
+    "energy_consumption": {
+        "meter": {"meter_SupWh"},
+    },
     "load_rate": {
         "compressor": {
             "air_comp_running_flag",
@@ -91,6 +98,7 @@ UNITS = {
     "air_comp_supply_pressure": "MPa",
     "air_system_header_pressure_mpa": "MPa",
     "air_comp_main_current_a": "A",
+    "air_comp_discharge_temp": "°C",
     "air_comp_running_hours": "h",
     "air_comp_loading_hours": "h",
     "air_comp_start_count": "count",
@@ -104,13 +112,17 @@ def infer_capabilities(message: str, explicit: Iterable[str] = ()) -> list[str]:
     requested = [item for item in explicit if item in CAPABILITY_KEYS]
     if requested:
         return list(dict.fromkeys(requested))
+    inferred = match_capabilities(message)
+    return inferred or DEFAULT_CAPABILITIES.copy()
+
+
+def match_capabilities(message: str) -> list[str]:
     lowered = message.lower()
-    inferred = [
+    return [
         capability
         for capability, keywords in CAPABILITY_KEYWORDS.items()
         if any(keyword in lowered for keyword in keywords)
     ]
-    return inferred or DEFAULT_CAPABILITIES.copy()
 
 
 def keys_for_device_type(capabilities: Iterable[str], device_type: str) -> list[str]:
@@ -118,4 +130,3 @@ def keys_for_device_type(capabilities: Iterable[str], device_type: str) -> list[
     for capability in capabilities:
         keys.update(CAPABILITY_KEYS.get(capability, {}).get(device_type, set()))
     return sorted(keys)
-

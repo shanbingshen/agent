@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
+from langchain_core.messages import ToolMessage
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -19,6 +20,13 @@ from arthra.contracts import JsonObject
 from arthra.control import ControlService
 from arthra.daily_summary import DailySummaryError, generate_daily_summary
 from arthra.db import get_db
+from arthra.industrial_data import IndustrialDataError
+from arthra.industrial_data.factory import get_industrial_data_service
+from arthra.industrial_data.schemas import (
+    IndustrialAlarmPage,
+    IndustrialDevicePage,
+    IndustrialTelemetryHistory,
+)
 from arthra.knowledge import chunk_text, embed_texts, search_knowledge
 from arthra.models import (
     AuditEvent,
@@ -29,11 +37,16 @@ from arthra.models import (
     Role,
     User,
 )
+from arthra.power.analysis import PowerAnalysisService
+from arthra.power.context import PowerContextError
+from arthra.power.schemas import PowerAnalysisRequest, PowerAnalysisResult
 from arthra.schemas import (
     AuditEventRead,
     ChatRequest,
     ControlPlanCreate,
     ControlPlanRead,
+    CustomerAnalysisView,
+    CustomerWarningView,
     DailySummaryCreate,
     DailySummaryRead,
     HealthResponse,
@@ -41,6 +54,7 @@ from arthra.schemas import (
     KnowledgeSearchResponse,
     KnowledgeUploadResponse,
     LoginRequest,
+    NodeProgressView,
     RejectRequest,
     SSEEvent,
     TokenResponse,
@@ -54,11 +68,48 @@ from arthra.security import (
     require_roles,
     verify_password,
 )
-from arthra.thingsboard import ThingsBoardClient, ThingsBoardError
-from arthra.thingsboard_schemas import AlarmPage, DevicePage, TelemetryHistory
 
 router = APIRouter(prefix="/api/v1")
 logger = logging.getLogger(__name__)
+
+
+def _quality_labels(analysis: object) -> tuple[str, str]:
+    context = getattr(analysis, "context", None)
+    quality = getattr(context, "data_quality", None)
+    coverage = getattr(quality, "coverage", None)
+    stale = bool(getattr(quality, "stale_keys", []))
+    invalid = bool(getattr(quality, "invalid_keys", []))
+    if not isinstance(coverage, (int, float)):
+        return "未知", "未知"
+    data_quality = "高" if coverage >= 0.98 and not stale and not invalid else "中" if coverage >= 0.8 else "低"
+    confidence = "高" if coverage >= 0.98 and not stale and not invalid else "中高" if coverage >= 0.9 else "中" if coverage >= 0.8 else "低"
+    warnings = getattr(analysis, "warnings", [])
+    if any("不平衡" in getattr(item, "message", "") for item in warnings) and confidence == "高":
+        confidence = "中高"
+    return data_quality, confidence
+
+
+def _customer_analysis_view(analysis: object | None) -> CustomerAnalysisView | None:
+    if analysis is None:
+        return None
+    data_quality, confidence = _quality_labels(analysis)
+    warnings = [
+        CustomerWarningView(
+            severity=getattr(item, "severity", "unknown"),
+            message=getattr(item, "message", "需要关注"),
+            device_name=getattr(item, "device_name", None),
+        )
+        for item in getattr(analysis, "warnings", [])
+    ]
+    return CustomerAnalysisView(
+        expert=getattr(analysis, "expert", "unknown"),
+        title=getattr(analysis, "title", "专家分析"),
+        data_status=getattr(analysis, "data_status", "unavailable"),
+        findings=list(getattr(analysis, "findings", [])),
+        warnings=warnings,
+        data_quality=data_quality,
+        confidence=confidence,
+    )
 
 
 def sse(event: str, content: object, node: str | None = None) -> str:
@@ -74,6 +125,29 @@ def sse(event: str, content: object, node: str | None = None) -> str:
     )
     payload = json.dumps(event_model.model_dump(mode="json"), ensure_ascii=False)
     return f"event: {event}\ndata: {payload}\n\n"
+
+
+def tool_event_content(message: ToolMessage) -> dict[str, object]:
+    parsed: dict = {}
+    if isinstance(message.content, str):
+        try:
+            candidate = json.loads(message.content)
+            if isinstance(candidate, dict):
+                parsed = candidate
+        except json.JSONDecodeError:
+            parsed = {}
+    capabilities = parsed.get("capabilities", [])
+    warnings = parsed.get("warnings", [])
+    missing_metrics = parsed.get("missing_metrics", [])
+    return {
+        "tool_call_id": message.tool_call_id,
+        "tool_name": message.name or "unknown",
+        "status": message.status,
+        "capabilities": capabilities if isinstance(capabilities, list) else [],
+        "data_status": parsed.get("data_status"),
+        "warning_count": len(warnings) if isinstance(warnings, list) else 0,
+        "missing_metric_count": len(missing_metrics) if isinstance(missing_metrics, list) else 0,
+    }
 
 
 @router.post("/auth/login", response_model=TokenResponse, tags=["auth"])
@@ -108,15 +182,19 @@ def create_user(
     return user
 
 
-@router.get("/devices", response_model=DevicePage, tags=["thingsboard"])
+@router.get("/devices", response_model=IndustrialDevicePage, tags=["industrial-data"])
 def devices(page: int = 0, page_size: int = Query(100, ge=1, le=1000), text_search: str = "", _: User = Depends(get_current_user)):
     try:
-        return ThingsBoardClient().list_devices(page, page_size, text_search)
-    except ThingsBoardError as exc:
+        return get_industrial_data_service().list_devices(page, page_size, text_search)
+    except IndustrialDataError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@router.get("/devices/{device_id}/telemetry", response_model=TelemetryHistory, tags=["thingsboard"])
+@router.get(
+    "/devices/{device_id}/telemetry",
+    response_model=IndustrialTelemetryHistory,
+    tags=["industrial-data"],
+)
 def telemetry(
     device_id: str,
     keys: str = "",
@@ -124,27 +202,38 @@ def telemetry(
     end_ts: int | None = None,
     _: User = Depends(get_current_user),
 ):
-    client = ThingsBoardClient()
+    service = get_industrial_data_service()
     parsed_keys = [key.strip() for key in keys.split(",") if key.strip()]
     try:
         if start_ts is not None and end_ts is not None:
-            return client.telemetry_history(device_id, parsed_keys, start_ts, end_ts)
-        return client.latest_telemetry(device_id, parsed_keys or None)
-    except ThingsBoardError as exc:
+            return service.telemetry_history(device_id, parsed_keys, start_ts, end_ts)
+        return service.latest_telemetry(device_id, parsed_keys or None)
+    except IndustrialDataError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@router.get("/devices/{device_id}/alarms", response_model=AlarmPage, tags=["thingsboard"])
+@router.get(
+    "/devices/{device_id}/alarms",
+    response_model=IndustrialAlarmPage,
+    tags=["industrial-data"],
+)
 def alarms(device_id: str, _: User = Depends(get_current_user)):
     try:
-        return ThingsBoardClient().list_alarms(device_id)
-    except ThingsBoardError as exc:
+        return get_industrial_data_service().list_alarms(device_id)
+    except IndustrialDataError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.post("/chat", tags=["agent"])
-def chat(payload: ChatRequest, request: Request, _: User = Depends(get_current_user)) -> StreamingResponse:
+def chat(payload: ChatRequest, request: Request, user: User = Depends(get_current_user)) -> StreamingResponse:
+    if payload.debug and user.role != Role.admin:
+        raise HTTPException(status_code=403, detail="只有管理员可以启用调试模式")
     graph = request.app.state.graph
+    graph_payload = {
+        "message": payload.message,
+        "device_scope": payload.effective_device_scope,
+        "presentation_mode": "debug" if payload.debug else "customer",
+    }
 
     def generate() -> Iterator[str]:
         try:
@@ -155,16 +244,53 @@ def chat(payload: ChatRequest, request: Request, _: User = Depends(get_current_u
                 }
             }
             final_state: dict = {}
-            for update in graph.stream(payload.model_dump(), config=config, stream_mode="updates"):
+            for update in graph.stream(
+                graph_payload,
+                config=config,
+                stream_mode="updates",
+                durability="exit",
+            ):
                 node, content = next(iter(update.items()))
                 final_state.update(content)
-                yield sse("node", content, node)
+                if node in {"compressor_tools", "power_tools"}:
+                    for message in content.get("messages", []):
+                        if isinstance(message, ToolMessage):
+                            yield sse("tool", tool_event_content(message), node)
+                else:
+                    yield sse("node", content if payload.debug else NodeProgressView(), node)
+            analysis = final_state.get("analysis")
+            public_analysis = analysis if payload.debug else _customer_analysis_view(analysis)
+            public_warnings = final_state.get("warnings", []) if payload.debug else (
+                public_analysis.warnings if public_analysis else []
+            )
+            route_decision = final_state.get("route_decision")
+            debug_intent = (
+                route_decision.get("intent")
+                if isinstance(route_decision, dict)
+                else getattr(route_decision, "intent", None)
+            )
             yield sse("message", {
+                "request_id": payload.request_id,
                 "thread_id": payload.thread_id,
                 "message": final_state.get("response", ""),
-                "analysis": final_state.get("analysis", {}),
-                "warnings": final_state.get("warnings", []),
+                "analysis": public_analysis,
+                "warnings": public_warnings,
                 "citations": final_state.get("citations", []),
+                "presentation_mode": "debug" if payload.debug else "customer",
+                **(
+                    {
+                        "intent": (
+                            debug_intent
+                        ),
+                        "selected_capabilities": (
+                            final_state.get("selected_power_capabilities")
+                            or final_state.get("selected_capabilities")
+                            or []
+                        ),
+                    }
+                    if payload.debug
+                    else {}
+                ),
             }, "synthesize")
             yield sse("done", {"thread_id": payload.thread_id})
         except ValidationError:
@@ -202,7 +328,24 @@ def compressor_analysis(
         return CompressorAnalysisService().analyze(payload)
     except CompressorContextError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except ThingsBoardError as exc:
+    except IndustrialDataError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@router.post(
+    "/power-analysis",
+    response_model=PowerAnalysisResult,
+    tags=["power"],
+)
+def power_analysis(
+    payload: PowerAnalysisRequest,
+    _: User = Depends(get_current_user),
+):
+    try:
+        return PowerAnalysisService().analyze(payload)
+    except PowerContextError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except IndustrialDataError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
@@ -221,7 +364,7 @@ def create_daily_summary(
         )
     except DailySummaryError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except ThingsBoardError as exc:
+    except IndustrialDataError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
@@ -322,4 +465,7 @@ def audit_events(limit: int = Query(100, ge=1, le=500), db: Session = Depends(ge
 
 @router.get("/health", include_in_schema=False)
 def health() -> HealthResponse:
-    return HealthResponse(time=datetime.now(UTC))
+    return HealthResponse(
+        time=datetime.now(UTC),
+        industrial_data_provider=get_settings().industrial_data_provider,
+    )
