@@ -1,20 +1,36 @@
 import { FormEvent, KeyboardEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
+  type ChatFeedbackReason,
   type ChatStreamEvent,
   type CompressorAnalysisResult,
+  type ContextTimeScope,
+  type CustomerAnswerMeta,
   type DailySummary,
   type Device,
+  type Factory,
   type PowerAnalysisResult,
+  sendChatFeedback,
   streamChat,
   type TelemetryPayload,
   type User,
+  type WorkspaceContext,
 } from "./api";
 
-type Workspace = "overview" | "demand" | "quality" | "compressor" | "carbon" | "events";
+type Workspace = WorkspaceContext;
 type Alarm = { type: string; severity: string; status: string; created_time: number };
 type DeviceSnapshot = { device: Device; telemetry: TelemetryPayload; history: TelemetryPayload; alarms: Alarm[] };
-type AssistantMessage = { id: string; who: "ai" | "you"; text: string; errorCode?: string; stopped?: boolean };
+type AssistantMessage = {
+  id: string;
+  who: "ai" | "you";
+  text: string;
+  createdAt?: string;
+  requestId?: string;
+  meta?: CustomerAnswerMeta;
+  tools?: string[];
+  errorCode?: string;
+  stopped?: boolean;
+};
 type InsightTone = "cyan" | "amber" | "green" | "muted";
 type InsightMetric = { label: string; value: string; tone?: InsightTone };
 type InsightEvidence = { label: string; value: string };
@@ -32,6 +48,74 @@ type PageInsight = {
   prompt: string;
 };
 
+const ASSISTANT_THREAD_KEY = "arthra_assistant_thread_id";
+const ASSISTANT_MESSAGES_KEY = "arthra_assistant_messages";
+
+const timeScopeLabels: Record<ContextTimeScope, string> = {
+  realtime: "当前最新",
+  today: "今日自然日",
+  yesterday: "昨日自然日",
+  last_24h: "最近24小时",
+  last_7d: "最近7天",
+  current_month: "本月",
+};
+
+const resultKindLabels: Record<CustomerAnswerMeta["result_kind"], string> = {
+  fact: "当前事实",
+  historical_statistic: "历史统计",
+  prediction: "预测结果",
+  inference: "辅助推断",
+  recommendation: "建议",
+  mixed: "综合分析",
+  data_insufficient: "数据不足",
+};
+
+const capabilityStateLabels: Record<CustomerAnswerMeta["capability_state"], string> = {
+  configured: "能力已配置",
+  not_configured: "能力未配置",
+  data_insufficient: "数据不足",
+  model_unavailable: "模型不可用",
+  reference_only: "知识说明",
+};
+
+const feedbackReasonLabels: Record<ChatFeedbackReason, string> = {
+  inaccurate_data: "数据不准确",
+  not_answered: "没有回答问题",
+  missing_evidence: "缺少证据",
+  wrong_context: "设备或时间错误",
+  unclear_expression: "表达不清",
+  other: "其他",
+};
+
+function clearAssistantSession() {
+  sessionStorage.removeItem(ASSISTANT_THREAD_KEY);
+  sessionStorage.removeItem(ASSISTANT_MESSAGES_KEY);
+}
+
+function loadAssistantThreadId(): string {
+  const current = sessionStorage.getItem(ASSISTANT_THREAD_KEY);
+  if (current) return current;
+  const created = `assistant-${crypto.randomUUID()}`;
+  sessionStorage.setItem(ASSISTANT_THREAD_KEY, created);
+  return created;
+}
+
+function loadAssistantMessages(): AssistantMessage[] {
+  try {
+    const value: unknown = JSON.parse(sessionStorage.getItem(ASSISTANT_MESSAGES_KEY) || "[]");
+    if (!Array.isArray(value)) return [];
+    return value.filter((item): item is AssistantMessage => {
+      if (!item || typeof item !== "object") return false;
+      const message = item as Partial<AssistantMessage>;
+      return typeof message.id === "string"
+        && (message.who === "ai" || message.who === "you")
+        && typeof message.text === "string";
+    }).slice(-40);
+  } catch {
+    return [];
+  }
+}
+
 const navItems: Array<{ id: Workspace; label: string; icon: string }> = [
   { id: "overview", label: "首页", icon: "⌂" },
   { id: "demand", label: "需量管理", icon: "▣" },
@@ -48,7 +132,7 @@ const toolLabels: Record<string, string> = {
   calculate_rolling_15m_max_demand: "15分钟最大需量",
   detect_power_peaks: "负荷峰值",
   analyze_peak_average_ratio: "峰均比",
-  detect_declared_demand_exceedance: "申报需量越限",
+  detect_declared_demand_exceedance: "需量控制目标越限",
   detect_voltage_deviation: "电压偏差",
   detect_three_phase_imbalance: "三相不平衡",
   detect_power_factor_anomaly: "功率因数",
@@ -154,26 +238,29 @@ function Login({ onLogin }: { onLogin: (token: string) => void }) {
   </main>;
 }
 
-function useOperationsData(token: string) {
+function useOperationsData(token: string, factoryId: string) {
   const [devices, setDevices] = useState<Device[]>([]);
   const [snapshots, setSnapshots] = useState<DeviceSnapshot[]>([]);
   const [summaries, setSummaries] = useState<DailySummary[]>([]);
   const [powerAnalysis, setPowerAnalysis] = useState<PowerAnalysisResult | null>(null);
   const [compressorAnalysis, setCompressorAnalysis] = useState<CompressorAnalysisResult | null>(null);
-  const [loading, setLoading] = useState(Boolean(token));
+  const [loading, setLoading] = useState(Boolean(token && factoryId));
   const [summaryBusy, setSummaryBusy] = useState(false);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (!token) {
+    if (!token || !factoryId) {
+      setDevices([]); setSnapshots([]); setSummaries([]);
+      setPowerAnalysis(null); setCompressorAnalysis(null);
       setLoading(false);
       return;
     }
+    const factoryQuery = `factory_id=${encodeURIComponent(factoryId)}`;
     let active = true;
     async function load() {
       setLoading(true); setError("");
       try {
-        const page = await api<{ data: Device[] }>("/devices", token);
+        const page = await api<{ data: Device[] }>(`/devices?${factoryQuery}`, token);
         const relevant = (page.data || []).filter(device => ["ems", "meter", "compressor"].includes(device.type));
         if (!active) return;
         setDevices(relevant);
@@ -187,20 +274,20 @@ function useOperationsData(token: string) {
               : ["power_kw", "energy_kwh", "soc", "mode"];
           const keyQuery = encodeURIComponent(keys.join(","));
           const [telemetry, history, alarmPage] = await Promise.all([
-            api<TelemetryPayload>(`/devices/${device.id.id}/telemetry?keys=${keyQuery}`, token).catch(() => ({})),
-            api<TelemetryPayload>(`/devices/${device.id.id}/telemetry?keys=${keyQuery}&start_ts=${start}&end_ts=${now}`, token).catch(() => ({})),
-            api<{ data: Alarm[] }>(`/devices/${device.id.id}/alarms`, token).catch(() => ({ data: [] })),
+            api<TelemetryPayload>(`/devices/${device.id.id}/telemetry?keys=${keyQuery}&${factoryQuery}`, token).catch(() => ({})),
+            api<TelemetryPayload>(`/devices/${device.id.id}/telemetry?keys=${keyQuery}&start_ts=${start}&end_ts=${now}&${factoryQuery}`, token).catch(() => ({})),
+            api<{ data: Alarm[] }>(`/devices/${device.id.id}/alarms?${factoryQuery}`, token).catch(() => ({ data: [] })),
           ]);
           return { device, telemetry, history, alarms: alarmPage.data || [] };
         }));
-        const recentSummaries = await api<DailySummary[]>("/daily-summaries?limit=7", token).catch(() => []);
+        const recentSummaries = await api<DailySummary[]>(`/daily-summaries?limit=7&${factoryQuery}`, token).catch(() => []);
         if (!active) return;
         setSnapshots(rows); setSummaries(recentSummaries);
 
         const meter = relevant.find(device => device.type === "meter");
         const compressor = relevant.find(device => device.type === "compressor");
         if (meter) {
-          void api<PowerAnalysisResult>("/power-analysis", token, {
+          void api<PowerAnalysisResult>(`/power-analysis?${factoryQuery}`, token, {
             method: "POST",
             body: JSON.stringify({
               message: "为前端驾驶舱计算需量与电能质量指标",
@@ -210,7 +297,7 @@ function useOperationsData(token: string) {
           }).then(result => active && setPowerAnalysis(result)).catch(() => active && setPowerAnalysis(null));
         }
         if (compressor) {
-          void api<CompressorAnalysisResult>("/compressor-analysis", token, {
+          void api<CompressorAnalysisResult>(`/compressor-analysis?${factoryQuery}`, token, {
             method: "POST",
             body: JSON.stringify({
               message: "为前端驾驶舱计算空压系统运行指标",
@@ -226,16 +313,19 @@ function useOperationsData(token: string) {
     void load();
     const timer = window.setInterval(load, 60_000);
     return () => { active = false; window.clearInterval(timer); };
-  }, [token]);
+  }, [token, factoryId]);
 
   async function refreshSummary() {
-    if (!token || summaryBusy) return;
+    if (!token || !factoryId || summaryBusy) return;
     setSummaryBusy(true);
     setError("");
     try {
       const summary = await api<DailySummary>("/daily-summaries/generate", token, {
         method: "POST",
-        body: JSON.stringify({ device_scope: devices.map(device => device.id.id) }),
+        body: JSON.stringify({
+          factory_id: factoryId,
+          device_scope: devices.map(device => device.id.id),
+        }),
       });
       setSummaries(current => [summary, ...current.filter(item => item.id !== summary.id)].slice(0, 7));
     } catch (reason) {
@@ -383,11 +473,11 @@ function InsightRail({
 
     const demandInsights: PageInsight[] = [
       { id: "demand-peak", icon: "!", tone: demandMargin != null && demandMargin < 0 ? "amber" : "cyan", title: "峰值风险", badge: "15 分钟需量",
-        summary: demandMargin == null ? "申报需量或滚动需量数据不足" : demandMargin < 0 ? `已超申报需量 ${format(Math.abs(demandMargin))} kW` : `距申报需量尚余 ${format(demandMargin)} kW`,
+        summary: demandMargin == null ? "需量控制目标或滚动需量数据不足" : demandMargin < 0 ? `已超需量控制目标 ${format(Math.abs(demandMargin))} kW` : `距需量控制目标尚余 ${format(demandMargin)} kW`,
         detailTitle: demandMargin == null ? "当前不能完成需量越限判断。" : demandMargin < 0 ? "15 分钟滚动需量已超过申报值。" : "当前 15 分钟滚动需量未超过申报值。",
         detailSummary: "需量风险只使用 15 分钟滚动需量判定，不以实时功率或周期不明的寄存器替代。",
-        metrics: [{ label: "最大滚动需量", value: demand?.max_demand_15m_kw != null ? `${format(demand.max_demand_15m_kw)} kW` : "数据不足" }, { label: "申报需量", value: demand?.declared_demand_kw != null ? `${format(demand.declared_demand_kw)} kW` : "未配置" }, { label: "剩余裕度", value: demandMargin != null ? `${format(demandMargin)} kW` : "无法计算", tone: demandMargin != null && demandMargin < 0 ? "amber" : "green" }],
-        evidence: [...baseEvidence, { label: "判定口径", value: "15 分钟滚动平均 vs 申报需量" }], prompt: "解释当前15分钟需量风险、申报需量裕度和判断依据" },
+        metrics: [{ label: "最大滚动需量", value: demand?.max_demand_15m_kw != null ? `${format(demand.max_demand_15m_kw)} kW` : "数据不足" }, { label: "需量控制目标", value: demand?.declared_demand_kw != null ? `${format(demand.declared_demand_kw)} kW` : "未配置" }, { label: "剩余裕度", value: demandMargin != null ? `${format(demandMargin)} kW` : "无法计算", tone: demandMargin != null && demandMargin < 0 ? "amber" : "green" }],
+        evidence: [...baseEvidence, { label: "判定口径", value: "15 分钟滚动平均 vs 需量控制目标" }], prompt: "解释当前15分钟需量风险、需量控制目标裕度和判断依据" },
       { id: "demand-shaving", icon: "∿", tone: peakSpread != null && peakSpread > 0 ? "green" : "muted", title: "削峰机会", badge: "峰值优化线索",
         summary: peakSpread != null ? `峰值高于平均负荷 ${format(peakSpread)} kW` : "等待峰值与平均负荷数据",
         detailTitle: peakSpread != null ? "负荷曲线存在可进一步核验的峰均差。" : "当前无法识别可量化的削峰空间。",
@@ -538,8 +628,8 @@ function DemandWorkspace({ analysis, history, onAsk }: { analysis: PowerAnalysis
   const metric = latestRecord(analysis?.metrics?.demand);
   const margin = metric?.declared_demand_kw != null && metric.max_demand_15m_kw != null ? metric.declared_demand_kw - metric.max_demand_15m_kw : undefined;
   return <div className="domain-workspace">
-    <div className="domain-main"><div className="domain-heading"><div><p>LOAD & DEMAND EXPERT</p><h2>15 分钟需量监测</h2></div><button onClick={() => onAsk("分析当前15分钟最大需量、峰均比和申报需量风险")}>询问需量专家</button></div>
-      <div className="domain-metrics"><MetricTile icon="D" label="15分钟最大需量" value={format(metric?.max_demand_15m_kw)} unit="kW" note="滚动平均确定性计算" /><MetricTile icon="↥" label="负荷峰值" value={format(metric?.instantaneous_peak_kw)} unit="kW" note="60秒桶峰值" /><MetricTile icon="÷" label="峰均比" value={format(metric?.peak_average_ratio, 3)} unit="" note={metric?.average_load_kw != null ? `平均负荷 ${format(metric.average_load_kw)} kW` : "等待历史数据"} tone="green" /><MetricTile icon="△" label="剩余需量裕度" value={format(margin)} unit="kW" note={margin == null ? "申报需量未配置" : margin >= 0 ? "尚未发生需量越限" : "已发生需量越限"} tone={margin != null && margin < 0 ? "amber" : "green"} /></div>
+    <div className="domain-main"><div className="domain-heading"><div><p>LOAD & DEMAND EXPERT</p><h2>15 分钟需量监测</h2></div><button onClick={() => onAsk("分析当前15分钟最大需量、峰均比和需量控制目标风险")}>询问需量专家</button></div>
+      <div className="domain-metrics"><MetricTile icon="D" label="15分钟最大需量" value={format(metric?.max_demand_15m_kw)} unit="kW" note="滚动平均确定性计算" /><MetricTile icon="↥" label="负荷峰值" value={format(metric?.instantaneous_peak_kw)} unit="kW" note="60秒桶峰值" /><MetricTile icon="÷" label="峰均比" value={format(metric?.peak_average_ratio, 3)} unit="" note={metric?.average_load_kw != null ? `平均负荷 ${format(metric.average_load_kw)} kW` : "等待历史数据"} tone="green" /><MetricTile icon="△" label="剩余需量裕度" value={format(margin)} unit="kW" note={margin == null ? "需量控制目标未配置" : margin >= 0 ? "尚未发生需量越限" : "已发生需量越限"} tone={margin != null && margin < 0 ? "amber" : "green"} /></div>
       <section className="wide-chart"><div className="section-head"><div><p>实际功率</p><h3>24小时负荷证据</h3></div><span>实时功率不等于计费需量</span></div><Bars values={history} /></section>
     </div><InsightList title="需量风险与建议" warnings={analysis?.warnings} empty="当前已执行的需量工具未产生越限提醒，建议保持监测。" />
   </div>;
@@ -594,7 +684,7 @@ const assistantSuggestions: Record<Workspace, Array<{ tag: string; text: string 
     { tag: "设备状态", text: "哪些设备当前需要优先关注？" },
   ],
   demand: [
-    { tag: "需量风险", text: "分析当前15分钟最大需量和申报需量风险" },
+    { tag: "需量风险", text: "分析当前15分钟最大需量和需量控制目标风险" },
     { tag: "峰均比", text: "当前负荷峰均比是否异常？" },
     { tag: "峰值", text: "过去24小时负荷峰值发生在什么时候？" },
     { tag: "依据", text: "解释需量判断使用的数据口径" },
@@ -625,31 +715,83 @@ const assistantSuggestions: Record<Workspace, Array<{ tag: string; text: string 
   ],
 };
 
-function Assistant({ token, deviceIds, open, prompt, workspace, onOpenChange }: { token: string; deviceIds: string[]; open: boolean; prompt: string; workspace: Workspace; onOpenChange: (open: boolean) => void }) {
-  const [threadId, setThreadId] = useState(() => `assistant-${crypto.randomUUID()}`);
+function devicesForWorkspace(devices: Device[], workspace: Workspace) {
+  if (workspace === "compressor") return devices.filter(device => device.type === "compressor");
+  if (workspace === "demand" || workspace === "quality") return devices.filter(device => device.type === "meter");
+  return devices.filter(device => ["ems", "meter", "compressor"].includes(device.type));
+}
+
+function friendlyDeviceName(device: Device, devices: Device[]) {
+  const sameType = devices.filter(item => item.type === device.type);
+  const ordinal = Math.max(1, sameType.findIndex(item => item.id.id === device.id.id) + 1);
+  const category = device.type === "compressor" ? `${ordinal}号空压机`
+    : device.type === "meter" ? `${ordinal}号电表`
+      : device.type === "ems" ? "能源总表" : "工业设备";
+  return `${category}（${device.name}）`;
+}
+
+function defaultContextDevice(workspace: Workspace, devices: Device[]) {
+  const scoped = devicesForWorkspace(devices, workspace);
+  if (["compressor", "demand", "quality"].includes(workspace) && scoped.length) return scoped[0].id.id;
+  return "all";
+}
+
+function displayMessageTime(value?: string) {
+  const date = value ? new Date(value) : new Date();
+  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+}
+
+function Assistant({ token, factoryId, devices, open, prompt, workspace, onOpenChange }: { token: string; factoryId: string; devices: Device[]; open: boolean; prompt: string; workspace: Workspace; onOpenChange: (open: boolean) => void }) {
+  const [threadId] = useState(loadAssistantThreadId);
   const [input, setInput] = useState("");
-  const [messages, setMessages] = useState<AssistantMessage[]>([]);
+  const [messages, setMessages] = useState<AssistantMessage[]>(loadAssistantMessages);
   const [tools, setTools] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState("理解问题");
   const [lastQuestion, setLastQuestion] = useState("");
   const [copiedId, setCopiedId] = useState("");
   const [feedback, setFeedback] = useState<Record<string, "up" | "down">>({});
+  const [feedbackDraft, setFeedbackDraft] = useState<{ messageId: string; reasons: ChatFeedbackReason[]; comment: string } | null>(null);
+  const [feedbackBusy, setFeedbackBusy] = useState(false);
+  const [feedbackError, setFeedbackError] = useState("");
+  const [evidenceOpen, setEvidenceOpen] = useState<Record<string, boolean>>({});
+  const [contextOpen, setContextOpen] = useState(false);
+  const [timeScope, setTimeScope] = useState<ContextTimeScope>("last_24h");
+  const [selectedDeviceId, setSelectedDeviceId] = useState(() => defaultContextDevice(workspace, devices));
+  const [composerExpanded, setComposerExpanded] = useState(false);
+  const [showLatest, setShowLatest] = useState(false);
   const controllerRef = useRef<AbortController | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  const previousWorkspace = useRef(workspace);
+  const messagesRef = useRef<HTMLDivElement | null>(null);
+  const autoFollowRef = useRef(true);
   const suggestions = assistantSuggestions[workspace];
+  const scopedDevices = useMemo(() => devicesForWorkspace(devices, workspace), [devices, workspace]);
+  const scopedDeviceKey = scopedDevices.map(device => device.id.id).join(",");
+  const selectedDevice = scopedDevices.find(device => device.id.id === selectedDeviceId);
+  const effectiveDeviceIds = selectedDeviceId === "all"
+    ? scopedDevices.map(device => device.id.id)
+    : selectedDevice ? [selectedDevice.id.id] : [];
+  const contextDeviceLabel = selectedDevice
+    ? friendlyDeviceName(selectedDevice, devices)
+    : `全部当前页面设备（${scopedDevices.length}台）`;
 
   useEffect(() => { if (prompt) setInput(prompt.slice(0, 500)); }, [prompt]);
   useEffect(() => { if (open) window.setTimeout(() => inputRef.current?.focus(), 80); }, [open]);
   useEffect(() => {
-    if (previousWorkspace.current === workspace) return;
-    controllerRef.current?.abort();
-    setBusy(false); setMessages([]); setTools([]); setInput("");
-    setThreadId(`assistant-${crypto.randomUUID()}`);
-    previousWorkspace.current = workspace;
-  }, [workspace]);
+    setSelectedDeviceId(defaultContextDevice(workspace, devices));
+    setContextOpen(false);
+  }, [workspace, scopedDeviceKey]);
+  useEffect(() => {
+    sessionStorage.setItem(ASSISTANT_MESSAGES_KEY, JSON.stringify(messages.slice(-40)));
+  }, [messages]);
   useEffect(() => () => controllerRef.current?.abort(), []);
+  useEffect(() => {
+    if (!open || !autoFollowRef.current) return;
+    window.requestAnimationFrame(() => {
+      const element = messagesRef.current;
+      if (element) element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+    });
+  }, [messages, busy, open]);
 
   function close() {
     if (busy) controllerRef.current?.abort();
@@ -666,34 +808,43 @@ function Assistant({ token, deviceIds, open, prompt, workspace, onOpenChange }: 
     const question = questionValue.trim();
     if (!question || busy || question.length > 500) return;
     const controller = new AbortController();
+    const requestId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
     controllerRef.current = controller;
     setInput(""); setTools([]); setBusy(true); setProgress("理解问题"); setLastQuestion(question);
-    setMessages(current => [...current, { id: crypto.randomUUID(), who: "you", text: question }, { id: "streaming", who: "ai", text: "" }]);
+    autoFollowRef.current = true;
+    setShowLatest(false);
+    setMessages(current => [...current, { id: crypto.randomUUID(), who: "you", text: question, createdAt }, { id: "streaming", who: "ai", text: "", createdAt, requestId }]);
     let answer = "";
     let hasError = false;
+    let answerMeta: CustomerAnswerMeta | undefined;
+    const answerTools: string[] = [];
     try {
       await streamChat(token, {
-        request_id: crypto.randomUUID(), thread_id: threadId, message: question,
-        device_scope: deviceIds, page_context: { selected_device_ids: deviceIds },
+        request_id: requestId, thread_id: threadId, message: question,
+        device_scope: effectiveDeviceIds,
+        page_context: { factory_id: factoryId, selected_device_ids: effectiveDeviceIds, workspace, time_scope: timeScope },
       }, (event: ChatStreamEvent) => {
         if (event.event === "node") setProgress("查询指标");
         if (event.event === "tool") {
           setProgress("查询指标");
           const name = String(event.content?.tool_name || "");
           const label = toolLabels[name] || name;
-          if (label) setTools(current => current.includes(label) ? current : [...current, label]);
+          if (label && !answerTools.includes(label)) answerTools.push(label);
+          if (label) setTools([...answerTools]);
         }
         if (event.event === "message") {
           setProgress("组织答案");
           answer = String(event.content?.message || "");
-          setMessages(current => current.map(message => message.id === "streaming" ? { ...message, text: answer } : message));
+          answerMeta = event.content?.answer_meta as CustomerAnswerMeta | undefined;
+          setMessages(current => current.map(message => message.id === "streaming" ? { ...message, text: answer, meta: answerMeta, tools: [...answerTools] } : message));
         }
         if (event.event === "error") {
           hasError = true;
           answer = String(event.content?.message || "AI 服务暂时不可用");
         }
       }, controller.signal);
-      setMessages(current => current.map(message => message.id === "streaming" ? { ...message, id: crypto.randomUUID(), text: answer || "分析完成，但没有返回可展示内容。", errorCode: hasError ? "AI-504" : undefined } : message));
+      setMessages(current => current.map(message => message.id === "streaming" ? { ...message, id: crypto.randomUUID(), requestId, meta: answerMeta, tools: [...answerTools], text: answer || "分析完成，但没有返回可展示内容。", errorCode: hasError ? "AI-504" : undefined } : message));
     } catch (reason) {
       if (controller.signal.aborted) return;
       const offline = typeof navigator !== "undefined" && !navigator.onLine;
@@ -716,23 +867,102 @@ function Assistant({ token, deviceIds, open, prompt, workspace, onOpenChange }: 
     await navigator.clipboard.writeText(message.text);
     setCopiedId(message.id); window.setTimeout(() => setCopiedId(""), 1500);
   }
+  function handleMessagesScroll() {
+    const element = messagesRef.current;
+    if (!element) return;
+    const away = element.scrollHeight - element.scrollTop - element.clientHeight > 90;
+    autoFollowRef.current = !away;
+    setShowLatest(away);
+  }
+  function scrollToLatest() {
+    const element = messagesRef.current;
+    if (!element) return;
+    autoFollowRef.current = true;
+    setShowLatest(false);
+    element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+  }
+  async function recordHelpful(message: AssistantMessage) {
+    if (!message.requestId || feedbackBusy) return;
+    setFeedbackBusy(true); setFeedbackError("");
+    try {
+      await sendChatFeedback(token, {
+        request_id: message.requestId,
+        thread_id: threadId,
+        message_id: message.id,
+        rating: "helpful",
+        reasons: [],
+        comment: "",
+      });
+      setFeedback(current => ({ ...current, [message.id]: "up" }));
+      setFeedbackDraft(null);
+    } catch {
+      setFeedbackError("反馈提交失败，请稍后重试。");
+    } finally {
+      setFeedbackBusy(false);
+    }
+  }
+  function toggleFeedbackReason(reason: ChatFeedbackReason) {
+    setFeedbackDraft(current => current ? {
+      ...current,
+      reasons: current.reasons.includes(reason)
+        ? current.reasons.filter(item => item !== reason)
+        : [...current.reasons, reason],
+    } : current);
+  }
+  async function submitImprovement(message: AssistantMessage) {
+    if (!message.requestId || !feedbackDraft?.reasons.length || feedbackBusy) return;
+    setFeedbackBusy(true); setFeedbackError("");
+    try {
+      await sendChatFeedback(token, {
+        request_id: message.requestId,
+        thread_id: threadId,
+        message_id: message.id,
+        rating: "needs_improvement",
+        reasons: feedbackDraft.reasons,
+        comment: feedbackDraft.comment.trim(),
+      });
+      setFeedback(current => ({ ...current, [message.id]: "down" }));
+      setFeedbackDraft(null);
+    } catch {
+      setFeedbackError("反馈提交失败，请稍后重试。");
+    } finally {
+      setFeedbackBusy(false);
+    }
+  }
 
   return <>
     <button className={`assistant-fab ${open ? "active" : ""}`} onClick={() => open ? close() : onOpenChange(true)} aria-label={open ? "关闭 AI 助手" : "打开 AI 助手"}><i>AI</i><span>AI 助手</span><b>{open ? "×" : ">"}</b></button>
     {open && <div className="assistant-overlay" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}>
       <section className="assistant-drawer" role="dialog" aria-modal="true" aria-labelledby="assistant-title">
-        <header><div><span><strong id="assistant-title">Aethra AI 助手</strong><small><i />当前工厂 · {workspaceLabels[workspace]} · {deviceIds.length} 台设备</small></span></div><div className="assistant-window-actions"><button type="button" onClick={() => onOpenChange(false)} aria-label="最小化 AI 助手">−</button><button type="button" onClick={close} aria-label="关闭 AI 助手">×</button></div></header>
-        <div className="assistant-messages">
+        <header><div><span><strong id="assistant-title">Aethra AI 助手</strong><button type="button" className="assistant-context-summary" onClick={() => setContextOpen(value => !value)} aria-expanded={contextOpen}><i />当前工厂 / {workspaceLabels[workspace]} / {contextDeviceLabel}<b>⌄</b></button><small>时间范围：{timeScopeLabels[timeScope]}</small></span></div><div className="assistant-window-actions"><button type="button" onClick={() => onOpenChange(false)} aria-label="最小化 AI 助手">−</button><button type="button" onClick={close} aria-label="关闭 AI 助手">×</button></div></header>
+        {contextOpen && <section className="assistant-context-panel" aria-label="当前分析上下文"><label><span>分析对象</span><select value={selectedDeviceId} onChange={event => setSelectedDeviceId(event.target.value)}><option value="all">全部当前页面设备（{scopedDevices.length}台）</option>{scopedDevices.map(device => <option key={device.id.id} value={device.id.id}>{friendlyDeviceName(device, devices)}</option>)}</select></label><label><span>时间范围</span><select value={timeScope} onChange={event => setTimeScope(event.target.value as ContextTimeScope)}>{Object.entries(timeScopeLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><p>设备与时间会随下一条问题发送；问题中明确写出的时间优先。</p></section>}
+        <div className="assistant-messages" ref={messagesRef} onScroll={handleMessagesScroll}>
           {!messages.length && <div className="assistant-welcome"><i>AI</i><div><h3>你好，我是 Aethra</h3><p>我可以基于当前页面和已授权设备数据，回答能耗、需量、电能质量、空压及碳数据问题。</p></div></div>}
           {!messages.length && <div className="assistant-suggestions"><p>你可以这样问</p>{suggestions.map(item => <button type="button" key={item.text} onClick={() => void submit(item.text)}><span>{item.tag}</span><strong>{item.text}</strong><b aria-hidden="true">›</b></button>)}</div>}
           {messages.map(message => <article className={`assistant-message ${message.who} ${message.errorCode ? "error" : ""}`} key={message.id}>
-            {message.errorCode ? <div className="assistant-error"><i>!</i><h3>暂时无法生成答案</h3><p>{message.text}</p><button type="button" onClick={() => void submit(lastQuestion)} disabled={busy}>重新生成</button><small>错误码：{message.errorCode}</small></div> : <><div className="message-meta"><strong>{message.who === "ai" ? "Aethra AI" : "你"}</strong><time>{new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time></div><Markdown text={message.text || "正在组织答案…"} />{message.stopped && <div className="assistant-notice">已停止生成，已完成内容仍可查看。</div>}{message.who === "ai" && message.text && !message.stopped && <div className="message-actions"><button type="button" onClick={() => void copyAnswer(message)}>{copiedId === message.id ? "已复制" : "复制"}</button><button type="button" className={feedback[message.id] === "up" ? "selected" : ""} onClick={() => setFeedback(current => ({ ...current, [message.id]: "up" }))} aria-label="回答有帮助">有帮助</button><button type="button" className={feedback[message.id] === "down" ? "selected" : ""} onClick={() => setFeedback(current => ({ ...current, [message.id]: "down" }))} aria-label="回答需改进">需改进</button></div>}</>}
+            {message.errorCode ? <div className="assistant-error"><i>!</i><h3>暂时无法生成答案</h3><p>{message.text}</p><button type="button" onClick={() => void submit(lastQuestion)} disabled={busy}>重新生成</button><small>错误码：{message.errorCode}</small></div> : <>
+              <div className="message-meta"><strong>{message.who === "ai" ? "Aethra AI" : "你"}</strong><time>{displayMessageTime(message.createdAt)}</time></div>
+              {message.who === "ai" && <div className="assistant-answer-heading"><span>直接结论</span>{message.meta && <b className={message.meta.result_kind === "data_insufficient" ? "warning" : ""}>{resultKindLabels[message.meta.result_kind]}</b>}</div>}
+              <Markdown text={message.text || "正在组织答案…"} />
+              {message.meta?.expert_supplement_status === "unavailable" && <div className="assistant-notice">专家模型暂不可用，本回答保留确定性工具结果。</div>}
+              {message.stopped && <div className="assistant-notice">已停止生成，已完成内容仍可查看。</div>}
+              {message.who === "ai" && message.text && !message.stopped && <>
+                <div className="message-actions">
+                  <button type="button" onClick={() => void copyAnswer(message)}>{copiedId === message.id ? "已复制" : "复制"}</button>
+                  {(message.meta || message.tools?.length) && <button type="button" className={evidenceOpen[message.id] ? "selected" : ""} onClick={() => setEvidenceOpen(current => ({ ...current, [message.id]: !current[message.id] }))}>▤ {evidenceOpen[message.id] ? "收起证据" : "查看证据"}</button>}
+                  <button type="button" className={feedback[message.id] === "up" ? "selected" : ""} onClick={() => void recordHelpful(message)} disabled={feedbackBusy || !message.requestId} aria-label="回答有帮助">{feedback[message.id] === "up" ? "已反馈" : "有帮助"}</button>
+                  <button type="button" className={feedback[message.id] === "down" ? "selected" : ""} onClick={() => { setFeedbackError(""); setFeedbackDraft({ messageId: message.id, reasons: [], comment: "" }); }} disabled={!message.requestId} aria-label="回答需改进">需改进</button>
+                </div>
+                {evidenceOpen[message.id] && <section className="assistant-answer-evidence"><header><strong>Evidence · 回答依据</strong>{message.meta && <span>{capabilityStateLabels[message.meta.capability_state]}</span>}</header>{message.meta?.evidence.map(item => <div key={item.label}><span>{item.label}</span><b>{item.value}</b></div>)}{message.meta?.data_cutoff_at && <div><span>数据截至</span><b>{new Date(message.meta.data_cutoff_at).toLocaleString("zh-CN")}{message.meta.updating ? "（仍在更新）" : ""}</b></div>}{message.meta && <div><span>数据质量</span><b>{message.meta.data_quality}</b></div>}{message.tools?.length ? <div><span>确定性工具</span><b>{message.tools.join("、")}</b></div> : null}</section>}
+                {feedbackDraft?.messageId === message.id && <section className="assistant-feedback-panel"><strong>这条回答哪里需要改进？</strong><div>{(Object.keys(feedbackReasonLabels) as ChatFeedbackReason[]).map(reason => <button type="button" key={reason} className={feedbackDraft.reasons.includes(reason) ? "selected" : ""} onClick={() => toggleFeedbackReason(reason)}>{feedbackReasonLabels[reason]}</button>)}</div><textarea maxLength={500} value={feedbackDraft.comment} onChange={event => setFeedbackDraft(current => current ? { ...current, comment: event.target.value } : current)} placeholder="可补充说明（选填）" /><footer><button type="button" onClick={() => setFeedbackDraft(null)}>取消</button><button type="button" disabled={!feedbackDraft.reasons.length || feedbackBusy} onClick={() => void submitImprovement(message)}>提交反馈</button></footer>{feedbackError && <p>{feedbackError}</p>}</section>}
+              </>}
+            </>}
           </article>)}
-          {tools.length > 0 && <div className="assistant-evidence"><span>依据</span>{tools.map(tool => <b key={tool}>{tool}</b>)}<b>{deviceIds.length} 台设备范围</b></div>}
           {busy && <div className="assistant-generation"><strong>正在生成答案</strong><ol><li className="done">理解问题</li><li className={progress !== "理解问题" ? "done" : "active"}>查询指标</li><li className={progress === "组织答案" ? "active" : ""}>组织答案</li></ol><button type="button" onClick={stopGeneration}>停止生成</button></div>}
           {!busy && messages.some(message => message.who === "ai" && !message.errorCode) && <div className="assistant-followups"><span>继续追问</span>{suggestions.slice(0, 3).map(item => <button type="button" key={item.text} onClick={() => void submit(item.text)}>{item.tag}</button>)}</div>}
         </div>
-        <form className="assistant-composer" onSubmit={send}><textarea ref={inputRef} value={input} maxLength={500} disabled={busy} onKeyDown={handleKeyDown} onChange={event => setInput(event.target.value.slice(0, 500))} placeholder={busy ? "当前状态不可提问" : "输入你的能碳问题"} aria-label="输入你的能碳问题" /><div><span className={input.length >= 480 ? "limit" : ""}>{input.length}/500</span><small>Enter 发送 · Shift+Enter 换行</small></div><button disabled={busy || !input.trim()} aria-label="发送问题">↑</button></form>
+        {showLatest && <button type="button" className="assistant-back-latest" onClick={scrollToLatest}>↓ 回到最新消息</button>}
+        <form className={`assistant-composer ${composerExpanded ? "expanded" : ""}`} onSubmit={send}><textarea ref={inputRef} value={input} maxLength={500} disabled={busy} onKeyDown={handleKeyDown} onChange={event => setInput(event.target.value.slice(0, 500))} placeholder={busy ? "当前状态不可提问" : "输入你的能碳问题"} aria-label="输入你的能碳问题" /><div><span className={input.length >= 480 ? "limit" : ""}>{input.length}/500</span><button type="button" onClick={() => setComposerExpanded(value => !value)}>{composerExpanded ? "收起输入框" : "展开输入框"}</button><small>Enter 发送 · Shift+Enter 换行</small></div><button disabled={busy || !input.trim()} aria-label="发送问题">↑</button></form>
       </section>
     </div>}
   </>;
@@ -741,24 +971,58 @@ function Assistant({ token, deviceIds, open, prompt, workspace, onOpenChange }: 
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem("arthra_token") || "");
   const [user, setUser] = useState<User | null>(null);
+  const [factories, setFactories] = useState<Factory[]>([]);
+  const [factoryId, setFactoryId] = useState(() => sessionStorage.getItem("arthra_factory_id") || "");
   const [workspace, setWorkspace] = useState<Workspace>("overview");
   const [assistantOpen, setAssistantOpen] = useState(false);
   const [assistantPrompt, setAssistantPrompt] = useState("");
   const [clock, setClock] = useState(new Date());
-  const data = useOperationsData(token);
+  const data = useOperationsData(token, factoryId);
   useEffect(() => {
     if (!token) return;
-    api<User>("/auth/me", token).then(setUser).catch(() => { localStorage.removeItem("arthra_token"); setToken(""); });
-  }, [token]);
+    Promise.all([
+      api<User>("/auth/me", token),
+      api<Factory[]>("/factories", token),
+    ]).then(([currentUser, availableFactories]) => {
+      setUser(currentUser);
+      setFactories(availableFactories);
+      const selected = availableFactories.some(factory => factory.id === factoryId)
+        ? factoryId
+        : availableFactories[0]?.id || "";
+      setFactoryId(selected);
+      if (selected) sessionStorage.setItem("arthra_factory_id", selected);
+    }).catch(() => {
+      localStorage.removeItem("arthra_token");
+      clearAssistantSession();
+      setToken("");
+    });
+  }, [token, factoryId]);
   useEffect(() => { const timer = window.setInterval(() => setClock(new Date()), 30_000); return () => window.clearInterval(timer); }, []);
   const meter = data.snapshots.find(row => row.device.type === "meter");
   const history = seriesOf(meter?.history, "meter_TotW");
   const latestSummary = data.summaries[0];
   function ask(prompt: string) { setAssistantPrompt(prompt); setAssistantOpen(true); }
-  function login(value: string) { localStorage.setItem("arthra_token", value); setToken(value); }
+  function login(value: string) {
+    clearAssistantSession();
+    localStorage.setItem("arthra_token", value);
+    setToken(value);
+  }
+  function logout() {
+    localStorage.removeItem("arthra_token");
+    clearAssistantSession();
+    sessionStorage.removeItem("arthra_factory_id");
+    setToken("");
+  }
+  function selectFactory(nextFactoryId: string) {
+    if (!nextFactoryId || nextFactoryId === factoryId) return;
+    clearAssistantSession();
+    sessionStorage.setItem("arthra_factory_id", nextFactoryId);
+    setAssistantOpen(false);
+    setFactoryId(nextFactoryId);
+  }
   if (!token) return <Login onLogin={login} />;
   return <div className="control-room">
-    <header className="topbar"><div className="vista-brand"><strong>AethraVista<sup>TM</sup></strong><span>AI 能碳运营管理平台</span></div><div className="top-status"><span>{user?.role === "admin" ? "管理员" : "能源用户"}</span><time>数据更新 {clock.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time><i className={data.error ? "offline" : ""} /><button onClick={() => { localStorage.removeItem("arthra_token"); setToken(""); }}>退出</button></div></header>
+    <header className="topbar"><div className="vista-brand"><strong>AethraVista<sup>TM</sup></strong><span>AI 能碳运营管理平台</span></div><div className="top-status"><select aria-label="选择工厂" value={factoryId} onChange={event => selectFactory(event.target.value)}>{factories.map(factory => <option key={factory.id} value={factory.id}>{factory.name}</option>)}</select><span>{user?.role === "admin" ? "管理员" : "能源用户"}</span><time>数据更新 {clock.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}</time><i className={data.error ? "offline" : ""} /><button onClick={logout}>退出</button></div></header>
     {data.error && <div className="global-error">{data.error}</div>}
     <div className="dashboard-shell">
       <InsightRail workspace={workspace} summary={latestSummary} snapshots={data.snapshots} powerAnalysis={data.powerAnalysis} compressorAnalysis={data.compressorAnalysis} summaryBusy={data.summaryBusy} onRefresh={data.refreshSummary} onAsk={ask} />
@@ -773,6 +1037,6 @@ export default function App() {
       </main>
     </div>
     <nav className="bottom-nav">{navItems.map(item => <button key={item.id} className={workspace === item.id ? "active" : ""} onClick={() => setWorkspace(item.id)}><i>{item.icon}</i><span>{item.label}</span></button>)}</nav>
-    <Assistant token={token} deviceIds={data.devices.map(device => device.id.id)} open={assistantOpen} prompt={assistantPrompt} workspace={workspace} onOpenChange={setAssistantOpen} />
+    <Assistant key={factoryId} token={token} factoryId={factoryId} devices={data.devices} open={assistantOpen} prompt={assistantPrompt} workspace={workspace} onOpenChange={setAssistantOpen} />
   </div>;
 }

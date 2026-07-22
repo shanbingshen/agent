@@ -1,6 +1,9 @@
 export const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api/v1";
 
-export type User = { id: string; email: string; role: "admin" | "analyst" | "approver" };
+export type WorkspaceContext = "overview" | "demand" | "quality" | "compressor" | "carbon" | "events";
+export type ContextTimeScope = "realtime" | "today" | "yesterday" | "last_24h" | "last_7d" | "current_month";
+export type User = { id: string; tenant_id: string; email: string; role: "admin" | "analyst" | "approver" };
+export type Factory = { id: string; tenant_id: string; code: string; name: string; is_active: boolean };
 export type Device = { id: { id: string }; name: string; type: string };
 export type ControlPlan = {
   id: string; device_id: string; device_name: string; device_type: string;
@@ -11,6 +14,8 @@ export type ControlPlan = {
 
 export type DailySummary = {
   id: string;
+  tenant_id: string;
+  factory_id: string;
   summary_date: string;
   period_start: string;
   period_end: string;
@@ -39,7 +44,7 @@ export type ChatRequest = {
   thread_id: string;
   message: string;
   device_scope: string[];
-  page_context?: { selected_device_ids: string[] };
+  page_context?: { factory_id?: string; selected_device_ids: string[]; workspace?: WorkspaceContext; time_scope?: ContextTimeScope };
   debug?: boolean;
 };
 
@@ -48,6 +53,33 @@ export type ChatStreamEvent = {
   event: "node" | "tool" | "message" | "error" | "done";
   node?: string;
   content?: ChatEventContent;
+};
+
+export type CustomerAnswerMeta = {
+  result_kind: "fact" | "historical_statistic" | "prediction" | "inference" | "recommendation" | "mixed" | "data_insufficient";
+  capability_state: "configured" | "not_configured" | "data_insufficient" | "model_unavailable" | "reference_only";
+  data_snapshot_at: string;
+  data_cutoff_at?: string | null;
+  period_start?: string | null;
+  period_end?: string | null;
+  period_label: string;
+  updating: boolean;
+  metric_basis: string;
+  device_names: string[];
+  workspace?: WorkspaceContext | null;
+  data_quality: "高" | "中" | "低" | "未知";
+  expert_supplement_status: "provided" | "empty" | "unavailable" | "not_configured" | "not_applicable";
+  evidence: Array<{ label: string; value: string }>;
+};
+
+export type ChatFeedbackReason = "inaccurate_data" | "not_answered" | "missing_evidence" | "wrong_context" | "unclear_expression" | "other";
+export type ChatFeedbackRequest = {
+  request_id: string;
+  thread_id: string;
+  message_id: string;
+  rating: "helpful" | "needs_improvement";
+  reasons: ChatFeedbackReason[];
+  comment: string;
 };
 
 export type TelemetrySample = {
@@ -85,6 +117,9 @@ export type CompressorAnalysisResult = {
       load_rate_pct?: number | null;
       unload_rate_pct?: number | null;
       idle_running_minutes?: number | null;
+      longest_idle_running_minutes?: number | null;
+      idle_event_count?: number | null;
+      idle_periods?: Array<{ start_ts: number; end_ts: number; duration_minutes: number }>;
       starts_per_hour?: number | null;
     }>;
     realtime?: Record<string, {
@@ -151,4 +186,11 @@ export async function streamChat(
       onEvent(event);
     }
   }
+}
+
+export async function sendChatFeedback(token: string, payload: ChatFeedbackRequest): Promise<void> {
+  await api("/chat/feedback", token, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }

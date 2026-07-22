@@ -9,12 +9,13 @@ from zoneinfo import ZoneInfo
 from langchain_core.messages import AIMessage, AnyMessage, RemoveMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from langgraph.prebuilt import ToolNode
 from pydantic import Field
 
-from arthra.agent_schemas import ExpertAnalysis
+from arthra.agent_schemas import ExpertAnalysis, ModelSynthesisResult
 from arthra.agent_tools import TelemetryLoader, analyze_device_context, load_device_context
 from arthra.compressor.analysis import (
     analyze_compressor_query,
@@ -34,6 +35,12 @@ from arthra.compressor.schemas import (
 from arthra.compressor.tools import COMPRESSOR_GRAPH_TOOLS
 from arthra.config import get_settings
 from arthra.contracts import AnalysisWarning, Citation, StrictModel
+from arthra.conversation_schemas import (
+    ContextTimeScope,
+    ConversationContext,
+    ConversationTurn,
+    PageWorkspace,
+)
 from arthra.industrial_data import IndustrialDataError
 from arthra.power.analysis import merge_power_analysis_results
 from arthra.power.capabilities import (
@@ -73,7 +80,13 @@ class SemanticRouteOutput(StrictModel):
 
 
 class RouteDecision(SemanticRouteOutput):
-    source: Literal["qwen", "keyword", "keyword_fallback", "hybrid_guard"] = "qwen"
+    source: Literal[
+        "qwen",
+        "keyword",
+        "keyword_fallback",
+        "hybrid_guard",
+        "context",
+    ] = "qwen"
 
 
 RouteClassifier = Callable[[str, list[str]], RouteDecision]
@@ -96,6 +109,14 @@ class AgentState(StrictModel):
     message: str
     device_scope: list[str] = Field(default_factory=list)
     presentation_mode: Literal["customer", "debug"] = "customer"
+    page_workspace: PageWorkspace | None = None
+    page_time_scope: ContextTimeScope | None = None
+    conversation_context: ConversationContext = Field(default_factory=ConversationContext)
+    context_applied: bool = False
+    context_route_hint: Route | None = None
+    context_intent_hint: QuestionIntent = "UNKNOWN"
+    context_capabilities: list[str] = Field(default_factory=list, max_length=20)
+    context_time_range: QueryTimeRange | None = None
     route: Route | None = None
     route_decision: RouteDecision | None = None
     query_time_range: QueryTimeRange | None = None
@@ -118,6 +139,13 @@ class AgentState(StrictModel):
     warnings: list[AnalysisWarning] = Field(default_factory=list)
     citations: list[Citation] = Field(default_factory=list)
     response: str = ""
+    expert_supplement_status: Literal[
+        "provided",
+        "empty",
+        "unavailable",
+        "not_configured",
+        "not_applicable",
+    ] = "not_applicable"
 
 
 class ModelExplanationInput(StrictModel):
@@ -342,12 +370,146 @@ def classify_route(message: str, device_scope: list[str]) -> RouteDecision:
         )
 
 
+_FOLLOW_UP_MARKERS = (
+    "继续",
+    "接着",
+    "刚才",
+    "上一个",
+    "上一条",
+    "它",
+    "这台",
+    "该设备",
+    "这个",
+    "再分析",
+    "再看看",
+    "综合分析",
+    "怎么样",
+    "什么情况",
+    "有没有",
+)
+_EXPLICIT_TIME_MARKERS = (
+    "实时",
+    "当前",
+    "现在",
+    "今天",
+    "今日",
+    "昨天",
+    "前天",
+    "最近",
+    "过去",
+    "本月",
+)
+_WORKSPACE_ROUTE: dict[PageWorkspace, Route] = {
+    "overview": "ems",
+    "demand": "power",
+    "quality": "power",
+    "compressor": "compressor",
+    "carbon": "ems",
+    "events": "report",
+}
+
+
+def _page_time_range(scope: ContextTimeScope) -> QueryTimeRange:
+    phrase, realtime = {
+        "realtime": ("当前", True),
+        "today": ("今天", False),
+        "yesterday": ("昨天", False),
+        "last_24h": ("最近24小时", False),
+        "last_7d": ("最近7天", False),
+        "current_month": ("本月", False),
+    }[scope]
+    return resolve_time_range(
+        phrase,
+        timezone_name=get_settings().daily_summary_timezone,
+        realtime=realtime,
+    )
+
+
+def resolve_short_term_context(state: AgentState) -> dict[str, Any]:
+    context = state.conversation_context
+    definition = classify_question(state.message)
+    is_follow_up = any(marker in state.message.lower() for marker in _FOLLOW_UP_MARKERS)
+    workspace_route = _WORKSPACE_ROUTE.get(state.page_workspace) if state.page_workspace else None
+    route_hint: Route | None = None
+    intent_hint: QuestionIntent = "UNKNOWN"
+    capabilities: list[str] = []
+    time_range: QueryTimeRange | None = None
+
+    if is_follow_up and context.active_route not in {None, "conversation"}:
+        route_hint = context.active_route
+        if context.active_route == "compressor":
+            capabilities = match_capabilities(state.message)
+        elif context.active_route == "power":
+            capabilities = list(match_power_capabilities(state.message))
+        if capabilities:
+            intent_hint = "UNKNOWN"
+        else:
+            intent_hint = context.active_intent
+            capabilities = list(context.active_capabilities)
+    elif definition is None and is_follow_up and workspace_route is not None:
+        route_hint = workspace_route
+
+    has_explicit_time = any(marker in state.message for marker in _EXPLICIT_TIME_MARKERS)
+    if not has_explicit_time:
+        if is_follow_up and context.active_time_range is not None:
+            time_range = context.active_time_range
+        elif state.page_time_scope is not None:
+            time_range = _page_time_range(state.page_time_scope)
+
+    resolved_scope = list(state.device_scope or context.active_device_scope)
+    context_applied = bool(
+        route_hint
+        or time_range
+        or (not state.device_scope and resolved_scope)
+    )
+    return {
+        "device_scope": resolved_scope,
+        "context_applied": context_applied,
+        "context_route_hint": route_hint,
+        "context_intent_hint": intent_hint,
+        "context_capabilities": capabilities,
+        "context_time_range": time_range,
+        "route": None,
+        "route_decision": None,
+        "query_time_range": None,
+        "clarification_question": None,
+        "selected_capabilities": [],
+        "compressor_execution": None,
+        "compressor_context": None,
+        "pending_tool_calls": [],
+        "tool_results": [],
+        "selected_power_capabilities": [],
+        "power_execution": None,
+        "power_context": None,
+        "pending_power_tool_calls": [],
+        "power_tool_results": [],
+        "analysis": None,
+        "warnings": [],
+        "citations": [],
+        "response": "",
+        "expert_supplement_status": "not_applicable",
+    }
+
+
 def _supervisor_node(classifier: RouteClassifier):
     def node(state: AgentState) -> dict[str, Any]:
         decision = classifier(state.message, state.device_scope)
+        if (
+            state.context_route_hint is not None
+            and decision.route == "conversation"
+            and decision.intent == "UNKNOWN"
+        ):
+            decision = RouteDecision(
+                route=state.context_route_hint,
+                intent=state.context_intent_hint,
+                confidence=0.96,
+                reason="结合当前页面与最近一轮专家上下文解析省略指代",
+                capabilities=state.context_capabilities,
+                source="context",
+            )
         return {
             "route": decision.route,
-            "route_decision": decision.model_dump(),
+            "route_decision": decision,
         }
 
     return node
@@ -355,6 +517,51 @@ def _supervisor_node(classifier: RouteClassifier):
 
 def supervisor(state: AgentState) -> dict[str, Any]:
     return _supervisor_node(classify_route)(state)
+
+
+def remember_conversation_turn(state: AgentState) -> dict[str, Any]:
+    context = state.conversation_context
+    route = state.route or "conversation"
+    intent = state.route_decision.intent if state.route_decision else "UNKNOWN"
+    capabilities = [
+        *state.selected_power_capabilities,
+        *state.selected_capabilities,
+    ]
+    if not capabilities and state.route_decision:
+        capabilities = list(state.route_decision.capabilities)
+    capabilities = list(dict.fromkeys(str(item) for item in capabilities))
+    assistant_summary = " ".join(state.response.split())[:800]
+    turn = ConversationTurn(
+        user_message=state.message,
+        assistant_summary=assistant_summary,
+        route=route,
+        intent=intent,
+        device_scope=state.device_scope,
+        capabilities=capabilities,
+        time_range=state.query_time_range,
+    )
+    active_route = context.active_route
+    active_intent = context.active_intent
+    active_scope = list(context.active_device_scope)
+    active_capabilities = list(context.active_capabilities)
+    active_time_range = context.active_time_range
+    if route != "conversation":
+        active_route = route
+        active_intent = intent
+        active_scope = list(state.device_scope)
+        active_capabilities = capabilities
+        active_time_range = state.query_time_range
+    return {
+        "conversation_context": ConversationContext(
+            turns=[*context.turns[-11:], turn],
+            active_route=active_route,
+            active_intent=active_intent,
+            active_device_scope=active_scope,
+            active_capabilities=active_capabilities,
+            active_time_range=active_time_range,
+            active_workspace=state.page_workspace or context.active_workspace,
+        )
+    }
 
 
 EXPERT_TITLES: dict[Route, str] = {
@@ -365,6 +572,22 @@ EXPERT_TITLES: dict[Route, str] = {
     "report": "能碳报告汇总",
     "conversation": "闲聊与能力边界",
 }
+
+
+def _resolve_contextual_time_range(
+    state: AgentState,
+    *,
+    realtime: bool = False,
+    compare: bool = False,
+) -> QueryTimeRange:
+    if state.context_time_range is not None:
+        return state.context_time_range
+    return resolve_time_range(
+        state.message,
+        timezone_name=get_settings().daily_summary_timezone,
+        realtime=realtime,
+        compare=compare,
+    )
 
 
 def conversation(state: AgentState) -> dict[str, Any]:
@@ -505,9 +728,21 @@ def plan_compressor_tools(state: AgentState) -> dict[str, Any]:
             for capability in match_capabilities(state.message)
             if capability in COMPRESSOR_CAPABILITY_TOOL_MAP
         ]
-    time_range = resolve_time_range(
-        state.message,
-        timezone_name=get_settings().daily_summary_timezone,
+    if not selected and state.context_route_hint == "compressor":
+        selected = [
+            capability
+            for capability in state.context_capabilities
+            if capability in COMPRESSOR_CAPABILITY_TOOL_MAP
+        ]
+        if not selected:
+            selected = [
+                "realtime_status",
+                "energy_consumption",
+                "load_rate",
+                "pressure_fluctuation",
+            ]
+    time_range = _resolve_contextual_time_range(
+        state,
         realtime=bool(definition and definition.uses_realtime),
     )
     common = {
@@ -711,9 +946,21 @@ def plan_power_tools(state: AgentState) -> dict[str, Any]:
     selected = [capability for capability in suggested if capability in POWER_CAPABILITY_KEYS]
     if not selected and intent == "UNKNOWN":
         selected = match_power_capabilities(state.message)
-    time_range = resolve_time_range(
-        state.message,
-        timezone_name=get_settings().daily_summary_timezone,
+    if not selected and state.context_route_hint == "power":
+        selected = [
+            capability
+            for capability in state.context_capabilities
+            if capability in POWER_CAPABILITY_KEYS
+        ]
+        if not selected:
+            selected = [
+                "realtime_power",
+                "demand_15m",
+                "power_factor",
+                "phase_imbalance",
+            ]
+    time_range = _resolve_contextual_time_range(
+        state,
         realtime=bool(definition and definition.uses_realtime),
         compare=intent == "ENERGY_PERIOD_COMPARE",
     )
@@ -952,7 +1199,14 @@ def _render_compressor_response(
         if metric.unload_rate_pct is None:
             return prefix + f"{metric.device_name} 当前数据不足，无法计算卸载率。"
         threshold = get_settings().compressor_unload_rate_warning_pct
-        conclusion = "存在较明显的长时间卸载现象" if metric.unload_rate_pct > threshold else "未超过卸载率管理阈值"
+        rate_conclusion = "超过卸载率管理阈值" if metric.unload_rate_pct > threshold else "未超过卸载率管理阈值"
+        idle_threshold = get_settings().compressor_idle_warning_minutes
+        if metric.longest_idle_running_minutes is None:
+            conclusion = f"{rate_conclusion}；缺少连续卸载事件分段，暂不能判断是否存在长时间连续卸载"
+        elif metric.longest_idle_running_minutes >= idle_threshold:
+            conclusion = f"发现连续卸载超过 {idle_threshold:.0f} 分钟的管理阈值"
+        else:
+            conclusion = f"未发现连续卸载超过 {idle_threshold:.0f} 分钟；{rate_conclusion}"
         response = (
             f"{metric.device_name} 在统计周期内运行 {((metric.running_minutes or 0) / 60):.2f} 小时，"
             f"其中卸载 {((metric.unloaded_minutes or 0) / 60):.2f} 小时，"
@@ -961,16 +1215,40 @@ def _render_compressor_response(
         )
         if metric.longest_idle_running_minutes is not None:
             response += f"最长连续卸载约 {metric.longest_idle_running_minutes:.1f} 分钟。"
+        if metric.idle_event_count is not None:
+            response += f"共识别 {metric.idle_event_count} 段卸载事件。"
+        if metric.idle_periods:
+            principal_periods = sorted(
+                metric.idle_periods,
+                key=lambda item: item.duration_minutes,
+                reverse=True,
+            )[:3]
+            period_text = "、".join(
+                f"{_local_time(item.start_ts)}—{_local_time(item.end_ts)}"
+                f"（{item.duration_minutes:.1f}分钟）"
+                for item in principal_periods
+            )
+            response += f"主要时段：{period_text}。"
         return prefix + response + "建议核查同期用气需求、压力上下限和群控策略。"
 
     if intent == "COMPRESSOR_FREQUENT_START_STOP":
-        rows = list(analysis.metrics.devices.items())
-        if not rows or rows[0][1].start_count is None:
+        rows = [
+            metric
+            for metric in analysis.metrics.devices.values()
+            if metric.start_count is not None and metric.starts_per_hour is not None
+        ]
+        if not rows:
             return prefix + "当前缺少启停计数历史，无法判断频繁启停。"
-        metric = rows[0][1]
+        ranked = sorted(rows, key=lambda item: item.starts_per_hour or 0, reverse=True)
+        metric = ranked[0]
         threshold = get_settings().compressor_frequent_starts_per_hour
         conclusion = "超过管理阈值" if (metric.starts_per_hour or 0) > threshold else "未超过管理阈值"
-        return prefix + (
+        comparison = (
+            f"当前共比较 {len(ranked)} 台空压机，{metric.device_name} 启停频次最高。"
+            if len(ranked) > 1
+            else "当前仅接入1台具备有效启停数据的空压机，无法进行多设备频次排名。"
+        )
+        return prefix + comparison + (
             f"{metric.device_name} 在统计周期内启动 {metric.start_count} 次，"
             f"约 {metric.starts_per_hour:.2f} 次/小时，{conclusion}（{threshold:.1f} 次/小时）。"
             "建议结合同期管网压力和用气负荷核查控制压力带。"
@@ -1214,13 +1492,13 @@ def _render_power_response(
         if declared is None:
             return prefix + (
                 f"{lead_name} 15分钟最大需量为 {lead_metric.max_demand_15m_kw:.2f} kW，"
-                "但系统没有配置申报需量，无法判断是否越限。"
+                "但系统没有配置需量控制目标，无法判断是否越限。"
             )
         margin = declared - lead_metric.max_demand_15m_kw
         status = "已经越限" if margin < 0 else "尚未越限"
         response = (
             f"{lead_name} 15分钟最大需量为 {lead_metric.max_demand_15m_kw:.2f} kW，"
-            f"申报需量 {declared:.2f} kW，{status}；"
+            f"需量控制目标 {declared:.2f} kW，{status}；"
             f"{'超出' if margin < 0 else '剩余安全余量'} {abs(margin):.2f} kW。"
         )
         if intent == "DEMAND_RISK_QUERY":
@@ -1281,17 +1559,25 @@ def _render_power_response(
                 "建议结合同期大功率设备启动记录核查短时压降。"
             )
         facts: list[str] = []
+        quality_notice = ""
         if metric.current_unbalance:
             facts.append(f"电流不平衡最大 {metric.current_unbalance.max:.2f}%")
+            if metric.current_unbalance.max >= 50:
+                quality_notice = (
+                    f"数据质量核验优先：电流不平衡度达到 {metric.current_unbalance.max:.2f}% ，"
+                    "疑似缺相、低负载放大、CT接线/方向或采集同步异常，建议先核验三相电流原始值。"
+                )
         if metric.power_factor:
             facts.append(f"功率因数最低 {metric.power_factor.min:.3f}")
+        if metric.thdu:
+            facts.append(f"THDu最大 {max(item.max for item in metric.thdu.values()):.2f}%")
         if metric.thdi:
             facts.append(f"THDi最大 {max(item.max for item in metric.thdi.values()):.2f}%")
         if metric.harmonics:
             facts.append(
                 f"主导电流谐波 {metric.dominant_current_harmonic_order or '未知'} 次"
             )
-        return prefix + (
+        return prefix + quality_notice + (
             f"{device_name} 电能质量摘要：" + "；".join(facts) + "。"
             "这些结论均按平台内部阈值筛查；是否构成标准超限，需要结合PCC测点和适用标准确认。"
         )
@@ -1321,7 +1607,7 @@ def _render_power_response(
         if metric.max_demand_15m_kw is not None:
             lines.append(f"- {device_name} 15分钟最大需量：{metric.max_demand_15m_kw:.2f} kW")
         if metric.declared_demand_kw is not None:
-            lines.append(f"- 申报需量：{metric.declared_demand_kw:.2f} kW")
+            lines.append(f"- 需量控制目标：{metric.declared_demand_kw:.2f} kW")
         if metric.max_demand_15m_kw is not None and metric.declared_demand_kw:
             lines.append(f"- 需量利用率：{metric.max_demand_15m_kw / metric.declared_demand_kw * 100:.2f}%")
             lines.append(f"- 剩余安全余量：{metric.declared_demand_kw - metric.max_demand_15m_kw:.2f} kW")
@@ -1341,7 +1627,7 @@ def _render_power_response(
             [
                 "",
                 f"> 最高60秒平均功率 {lead_metric.instantaneous_peak_kw:.2f} kW "
-                f"{'超过' if lead_metric.instantaneous_peak_kw > lead_metric.declared_demand_kw else '未超过'}申报需量，"
+                f"{'超过' if lead_metric.instantaneous_peak_kw > lead_metric.declared_demand_kw else '未超过'}需量控制目标，"
                 "但60秒功率超过申报值不等于计费需量越限；需量结论只以15分钟滚动平均为准。",
             ]
         )
@@ -1422,7 +1708,7 @@ def _render_generic_response(analysis: ExpertAnalysis, *, debug: bool) -> str:
         lines.append(f"- {len(analysis.missing_metrics)} 项所需数据缺失，未据此推断设备故障。")
     lines.extend(["", "### 4. 可执行建议"])
     if has_meter:
-        lines.append("1. 如需判断需量风险，请指定电表并执行15分钟最大需量与申报需量越限分析。")
+        lines.append("1. 如需判断需量风险，请指定电表并执行15分钟最大需量与需量控制目标越限分析。")
     lines.append("2. 对异常读数先核查设备对象、点位映射和采样质量，再安排现场处置。")
     timestamps = [
         timestamp
@@ -1443,7 +1729,7 @@ def _render_response_with_llm(
     state: AgentState,
     analysis: ExpertAnalysis | CompressorAnalysisResult | PowerAnalysisResult,
     deterministic_response: str,
-) -> str:
+) -> ModelSynthesisResult:
     settings = get_settings()
     intent = state.route_decision.intent if state.route_decision else "UNKNOWN"
     intent_definition = INTENTS.get(intent)
@@ -1453,7 +1739,7 @@ def _render_response_with_llm(
             f"{deterministic_response}\n\n查询时间范围：{state.query_time_range.label}{default_note}。"
         )
     if intent_definition is not None and not intent_definition.use_llm_explanation:
-        return deterministic_response
+        return ModelSynthesisResult(response=deterministic_response)
     if isinstance(analysis, CompressorAnalysisResult):
         enabled = settings.compressor_expert_llm_enabled
         model_name = settings.compressor_expert_llm_model or settings.llm_model
@@ -1468,7 +1754,10 @@ def _render_response_with_llm(
         specialist_name = analysis.title
 
     if not enabled or not settings.llm_api_key:
-        return deterministic_response
+        return ModelSynthesisResult(
+            response=deterministic_response,
+            supplement_status="not_configured",
+        )
 
     model = ChatOpenAI(
         api_key=settings.llm_api_key,
@@ -1484,7 +1773,7 @@ def _render_response_with_llm(
             f"当前用户意图是 {intent}；只回答该意图，不要扩展到其他指标或专家能力。",
             "如证据不足，必须明确说明证据不足；不要把推测写成事实。",
             "不要给出结构化结果中没有出现的新数值；引用数值时必须保持原值与单位。",
-            "实时功率超过申报需量不等于15分钟计费需量越限，不得混淆两种口径。",
+            "实时功率超过需量控制目标不等于15分钟计费需量越限，不得混淆两种口径。",
             "电流不平衡和THDi触发的是平台内部预警，必须提示现场核验，不能直接认定标准超限。",
             "只输出一段不超过80个汉字的补充说明；如果没有必要补充，输出空字符串。",
             "不要输出标题、列表、Markdown或内部字段，不要重复客户报告中的全部指标。",
@@ -1505,12 +1794,31 @@ def _render_response_with_llm(
             "%s model synthesis failed; returning deterministic response",
             analysis.expert,
         )
-        return deterministic_response
+        return ModelSynthesisResult(
+            response=deterministic_response,
+            supplement_status="unavailable",
+        )
 
-    if not explanation:
-        return deterministic_response
+    normalized = explanation.strip().strip("`").strip()
+    empty_markers = {"", '""', "''", "null", "none", "无需补充", "无补充", "无"}
+    if normalized.lower() in empty_markers or not normalized.strip('"\'“”‘’ '):
+        return ModelSynthesisResult(
+            response=deterministic_response,
+            supplement_status="empty",
+        )
     label = f"模型补充（{model_name}）" if state.presentation_mode == "debug" else "专家补充"
-    return f"{deterministic_response}\n\n> {label}：{explanation}"
+    return ModelSynthesisResult(
+        response=f"{deterministic_response}\n\n> {label}：{normalized}",
+        supplement=normalized,
+        supplement_status="provided",
+    )
+
+
+def _synthesis_state(result: ModelSynthesisResult) -> dict[str, Any]:
+    return {
+        "response": result.response,
+        "expert_supplement_status": result.supplement_status,
+    }
 
 
 def synthesize(state: AgentState) -> dict[str, Any]:
@@ -1529,37 +1837,57 @@ def synthesize(state: AgentState) -> dict[str, Any]:
             debug=state.presentation_mode == "debug",
             intent=intent,
         )
-        return {
-            "response": _render_response_with_llm(
+        return _synthesis_state(
+            _render_response_with_llm(
                 state,
                 analysis,
                 deterministic_response,
             )
-        }
+        )
     if isinstance(analysis, PowerAnalysisResult):
         deterministic_response = _render_power_response(
             analysis,
             debug=state.presentation_mode == "debug",
             intent=intent,
         )
-        return {
-            "response": _render_response_with_llm(
+        return _synthesis_state(
+            _render_response_with_llm(
                 state,
                 analysis,
                 deterministic_response,
             )
-        }
+        )
     deterministic_response = _render_generic_response(
         analysis,
         debug=state.presentation_mode == "debug",
     )
-    return {
-        "response": _render_response_with_llm(
+    return _synthesis_state(
+        _render_response_with_llm(
             state,
             analysis,
             deterministic_response,
         )
-    }
+    )
+
+
+def agent_checkpoint_serializer() -> JsonPlusSerializer:
+    return JsonPlusSerializer(
+        allowed_msgpack_modules=(
+            AgentState,
+            CompressorToolCallPlan,
+            PowerToolCallPlan,
+            RouteDecision,
+            ExpertAnalysis,
+            CompressorAnalysisResult,
+            CompressorSystemContext,
+            PowerAnalysisResult,
+            PowerSystemContext,
+            AnalysisWarning,
+            ConversationContext,
+            ConversationTurn,
+            QueryTimeRange,
+        )
+    )
 
 
 def build_graph(
@@ -1572,6 +1900,7 @@ def build_graph(
     use_graph_tools = telemetry_loader is None and compressor_analyzer is None
     loader = telemetry_loader or load_device_context
     builder = StateGraph(AgentState)
+    builder.add_node("context_resolver", resolve_short_term_context)
     builder.add_node("supervisor", _supervisor_node(route_classifier or classify_route))
     builder.add_node("conversation", conversation)
     generic_routes = ("ems", "forecast", "report") if use_graph_tools else ("ems", "power", "forecast", "report")
@@ -1617,7 +1946,9 @@ def build_graph(
             ),
         )
     builder.add_node("synthesize", synthesize)
-    builder.add_edge(START, "supervisor")
+    builder.add_node("remember", remember_conversation_turn)
+    builder.add_edge(START, "context_resolver")
+    builder.add_edge("context_resolver", "supervisor")
     builder.add_conditional_edges(
         "supervisor",
         lambda state: state.route,
@@ -1630,7 +1961,7 @@ def build_graph(
             "conversation": "conversation",
         },
     )
-    builder.add_edge("conversation", END)
+    builder.add_edge("conversation", "remember")
     for route in generic_routes:
         builder.add_edge(route, "synthesize")
     if use_graph_tools:
@@ -1678,5 +2009,8 @@ def build_graph(
         builder.add_edge("power_collect", "synthesize")
     else:
         builder.add_edge("compressor", "synthesize")
-    builder.add_edge("synthesize", END)
-    return builder.compile(checkpointer=checkpointer or MemorySaver())
+    builder.add_edge("synthesize", "remember")
+    builder.add_edge("remember", END)
+    return builder.compile(
+        checkpointer=checkpointer or MemorySaver(serde=agent_checkpoint_serializer())
+    )

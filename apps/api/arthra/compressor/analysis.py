@@ -13,6 +13,7 @@ from arthra.compressor.schemas import (
     CompressorAnalysisResult,
     CompressorCapability,
     CompressorSystemContext,
+    IdleRunningPeriod,
     LoadUnloadRateDeviceResult,
     LoadUnloadRateToolInput,
     LoadUnloadRateToolResult,
@@ -80,6 +81,44 @@ def _longest_active_minutes(points: list[SignalPoint], interval_seconds: int) ->
             current = 0
         previous_ts = point.ts
     return round(longest, 2)
+
+
+def _active_periods(
+    points: list[SignalPoint],
+    interval_seconds: int,
+) -> list[IdleRunningPeriod]:
+    periods: list[IdleRunningPeriod] = []
+    start_ts: int | None = None
+    last_ts: int | None = None
+    duration_minutes = 0.0
+    max_gap_ms = interval_seconds * 1500
+
+    def close_period() -> None:
+        nonlocal start_ts, last_ts, duration_minutes
+        if start_ts is not None and last_ts is not None:
+            periods.append(
+                IdleRunningPeriod(
+                    start_ts=start_ts,
+                    end_ts=last_ts + interval_seconds * 1000,
+                    duration_minutes=round(duration_minutes, 2),
+                )
+            )
+        start_ts = None
+        last_ts = None
+        duration_minutes = 0.0
+
+    for point in sorted(points, key=lambda item: item.ts):
+        if last_ts is not None and point.ts - last_ts > max_gap_ms:
+            close_period()
+        if point.value > 0:
+            if start_ts is None:
+                start_ts = point.ts
+            duration_minutes += max(0, min(1, point.value)) * interval_seconds / 60
+            last_ts = point.ts
+        else:
+            close_period()
+    close_period()
+    return periods
 
 
 def _observation_hours(points: list[SignalPoint]) -> float | None:
@@ -278,8 +317,18 @@ def _analyze_operation(
         if "idle_running" in capabilities and unloaded:
             idle_minutes = sum(point.value for point in unloaded) * context.interval_seconds / 60
             longest_idle = _longest_active_minutes(unloaded, context.interval_seconds)
+            idle_periods = _active_periods(unloaded, context.interval_seconds)
             item["idle_running_minutes"] = round(idle_minutes, 2)
             item["longest_idle_running_minutes"] = longest_idle
+            item["idle_event_count"] = len(idle_periods)
+            item["idle_periods"] = [
+                period.model_dump(mode="json")
+                for period in sorted(
+                    idle_periods,
+                    key=lambda value: value.duration_minutes,
+                    reverse=True,
+                )[:100]
+            ]
             findings.append(
                 f"{compressor.device_name}: 窗口内卸载空载约 {idle_minutes:.2f} min，最长连续约 {longest_idle:.2f} min"
             )

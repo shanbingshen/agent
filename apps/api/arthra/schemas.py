@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import Field, model_validator
 
 from arthra.contracts import AnalysisWarning, JsonObject, OrmReadModel, StrictModel
+from arthra.conversation_schemas import ContextTimeScope, PageWorkspace
 from arthra.daily_schemas import DailySnapshot
 from arthra.models import ControlStatus, RiskLevel, Role
 
@@ -21,6 +22,7 @@ class LoginRequest(StrictModel):
 
 class UserRead(OrmReadModel):
     id: uuid.UUID
+    tenant_id: uuid.UUID
     email: str
     role: Role
 
@@ -29,11 +31,53 @@ class UserCreate(StrictModel):
     email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=8, max_length=256)
     role: Role = Role.analyst
+    factory_ids: list[uuid.UUID] = Field(default_factory=list, max_length=100)
+
+
+class TenantRead(OrmReadModel):
+    id: uuid.UUID
+    slug: str
+    name: str
+    is_active: bool
+
+
+class FactoryCreate(StrictModel):
+    code: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=1, max_length=255)
+
+
+class FactoryRead(OrmReadModel):
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    code: str
+    name: str
+    is_active: bool
+
+
+class FactoryDeviceCreate(StrictModel):
+    device_id: str = Field(min_length=1, max_length=128)
+    device_name: str = Field(min_length=1, max_length=255)
+    device_type: str = Field(min_length=1, max_length=64)
+
+
+class FactoryDeviceRead(OrmReadModel):
+    device_id: str
+    factory_id: uuid.UUID
+    device_name: str
+    device_type: str
+    is_active: bool
+
+
+class FactoryAccessGrant(StrictModel):
+    user_id: uuid.UUID
+    can_manage_devices: bool = False
 
 
 class ChatPageContext(StrictModel):
-    factory_id: str | None = Field(default=None, max_length=128)
+    factory_id: uuid.UUID | None = None
     selected_device_ids: list[str] = Field(default_factory=list, max_length=100)
+    workspace: PageWorkspace | None = None
+    time_scope: ContextTimeScope | None = None
 
 
 class ChatRequest(StrictModel):
@@ -66,16 +110,120 @@ class CustomerAnalysisView(StrictModel):
     confidence: Literal["高", "中高", "中", "低", "未知"] = "未知"
 
 
+type AnswerResultKind = Literal[
+    "fact",
+    "historical_statistic",
+    "prediction",
+    "inference",
+    "recommendation",
+    "mixed",
+    "data_insufficient",
+]
+type CapabilityState = Literal[
+    "configured",
+    "not_configured",
+    "data_insufficient",
+    "model_unavailable",
+    "reference_only",
+]
+type ExpertSupplementState = Literal[
+    "provided",
+    "empty",
+    "unavailable",
+    "not_configured",
+    "not_applicable",
+]
+
+
+class CustomerAnswerEvidence(StrictModel):
+    label: str = Field(min_length=1, max_length=64)
+    value: str = Field(min_length=1, max_length=500)
+
+
+class CustomerAnswerMeta(StrictModel):
+    result_kind: AnswerResultKind
+    capability_state: CapabilityState
+    data_snapshot_at: datetime
+    data_cutoff_at: datetime | None = None
+    period_start: datetime | None = None
+    period_end: datetime | None = None
+    period_label: str = Field(default="未指定", max_length=100)
+    updating: bool = False
+    metric_basis: str = Field(min_length=1, max_length=500)
+    device_names: list[str] = Field(default_factory=list, max_length=100)
+    workspace: PageWorkspace | None = None
+    data_quality: Literal["高", "中", "低", "未知"] = "未知"
+    expert_supplement_status: ExpertSupplementState = "not_applicable"
+    evidence: list[CustomerAnswerEvidence] = Field(default_factory=list, max_length=20)
+
+
+type ChatFeedbackRating = Literal["helpful", "needs_improvement"]
+type ChatFeedbackReason = Literal[
+    "inaccurate_data",
+    "not_answered",
+    "missing_evidence",
+    "wrong_context",
+    "unclear_expression",
+    "other",
+]
+
+
+class ChatFeedbackCreate(StrictModel):
+    request_id: str = Field(min_length=1, max_length=128)
+    thread_id: str = Field(min_length=1, max_length=128)
+    message_id: str = Field(min_length=1, max_length=128)
+    rating: ChatFeedbackRating
+    reasons: list[ChatFeedbackReason] = Field(default_factory=list, max_length=6)
+    comment: str = Field(default="", max_length=500)
+
+    @model_validator(mode="after")
+    def validate_improvement_reason(self) -> "ChatFeedbackCreate":
+        if self.rating == "needs_improvement" and not self.reasons:
+            raise ValueError("选择需改进时至少提供一个原因")
+        if self.rating == "helpful" and self.reasons:
+            raise ValueError("有帮助反馈不能携带改进原因")
+        return self
+
+
+class ChatFeedbackRead(StrictModel):
+    accepted: Literal[True] = True
+    feedback_id: uuid.UUID
+
+
+class AssistantAnswerAuditDetails(StrictModel):
+    thread_id: str = Field(min_length=1, max_length=128)
+    route: str | None = Field(default=None, max_length=64)
+    intent: str | None = Field(default=None, max_length=128)
+    capabilities: list[str] = Field(default_factory=list, max_length=20)
+    data_snapshot_at: datetime
+    data_cutoff_at: datetime | None = None
+    metric_version: str = Field(min_length=1, max_length=64)
+    rule_version: str = Field(min_length=1, max_length=64)
+    analysis_method: str | None = Field(default=None, max_length=128)
+    expert_supplement_status: ExpertSupplementState
+
+
+class ChatFeedbackAuditDetails(StrictModel):
+    thread_id: str = Field(min_length=1, max_length=128)
+    message_id: str = Field(min_length=1, max_length=128)
+    rating: ChatFeedbackRating
+    reasons: list[ChatFeedbackReason] = Field(default_factory=list, max_length=6)
+    comment: str = Field(default="", max_length=500)
+
+
 class NodeProgressView(StrictModel):
     status: Literal["completed"] = "completed"
 
 
 class DailySummaryCreate(StrictModel):
     device_scope: list[str] = Field(default_factory=list, max_length=100)
+    factory_id: uuid.UUID | None = None
 
 
 class DailySummaryRead(OrmReadModel):
     id: uuid.UUID
+    tenant_id: uuid.UUID
+    factory_id: uuid.UUID
     summary_date: date
     period_start: datetime
     period_end: datetime
@@ -84,6 +232,7 @@ class DailySummaryRead(OrmReadModel):
     device_scope: list[str]
     statistics: DailySnapshot
     warnings: list[AnalysisWarning]
+    insight_payload: JsonObject
     model_name: str
     status: str
     trigger: str
@@ -109,6 +258,7 @@ type ControllableDeviceType = Literal["ems", "meter", "compressor"]
 
 
 class ControlPlanCreate(StrictModel):
+    factory_id: uuid.UUID | None = None
     device_id: str
     device_name: str
     device_type: ControllableDeviceType
@@ -140,6 +290,8 @@ class ControlExecutionResult(StrictModel):
 
 class ControlPlanRead(OrmReadModel):
     id: uuid.UUID
+    tenant_id: uuid.UUID
+    factory_id: uuid.UUID
     device_id: str
     device_name: str
     device_type: ControllableDeviceType
@@ -167,6 +319,8 @@ class SSEEvent(StrictModel):
 
 class KnowledgeDocumentRead(OrmReadModel):
     id: uuid.UUID
+    tenant_id: uuid.UUID
+    factory_id: uuid.UUID
     filename: str
     media_type: str
     status: str
@@ -195,11 +349,32 @@ class KnowledgeSearchResponse(StrictModel):
 
 class AuditEventRead(OrmReadModel):
     id: uuid.UUID
+    tenant_id: uuid.UUID
+    factory_id: uuid.UUID | None
     actor_id: uuid.UUID | None
     action: str
     resource_type: str
     resource_id: str
     details: JsonObject
+    created_at: datetime
+
+
+class AgentTraceRead(OrmReadModel):
+    id: uuid.UUID
+    trace_id: str
+    request_id: str
+    tenant_id: uuid.UUID
+    factory_id: uuid.UUID
+    user_id: uuid.UUID | None
+    thread_id: str | None
+    operation: str
+    route: str | None
+    intent: str | None
+    status: str
+    duration_ms: float
+    node_timings: JsonObject
+    tool_names: list[str]
+    error_code: str | None
     created_at: datetime
 
 
