@@ -193,7 +193,10 @@ class ChatFeedbackRead(StrictModel):
 class AssistantAnswerAuditDetails(StrictModel):
     thread_id: str = Field(min_length=1, max_length=128)
     route: str | None = Field(default=None, max_length=64)
+    query_mode: str | None = Field(default=None, max_length=64)
+    domain: str | None = Field(default=None, max_length=64)
     intent: str | None = Field(default=None, max_length=128)
+    subject: str | None = Field(default=None, max_length=80)
     capabilities: list[str] = Field(default_factory=list, max_length=20)
     data_snapshot_at: datetime
     data_cutoff_at: datetime | None = None

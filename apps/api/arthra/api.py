@@ -196,6 +196,11 @@ def _answer_device_names(analysis: object | None) -> list[str]:
 
 def _answer_metric_basis(intent: str | None) -> str:
     return {
+        "KNOWLEDGE_EXPLANATION": "工业能源概念解释，不读取当前设备数据",
+        "KNOWLEDGE_POWER_FACTOR": "功率因数通用概念解释，不读取当前设备数据",
+        "KNOWLEDGE_POWER_ENERGY_DEMAND": "功率、电量和需量通用计量口径解释",
+        "KNOWLEDGE_COMPRESSOR_UNLOAD": "空压机加载与卸载通用运行原理解释",
+        "KNOWLEDGE_CUMULATIVE_ENERGY": "累计电量通用计量口径解释",
         "REALTIME_POWER_QUERY": "统一工业数据接口的最新有效有功功率读数",
         "ENERGY_PERIOD_QUERY": "累计正向有功电量期末值减期初值",
         "ENERGY_PERIOD_COMPARE": "两个同口径统计周期的累计电量差值比较",
@@ -229,12 +234,19 @@ def _customer_answer_meta(
         if isinstance(route_decision, dict)
         else getattr(route_decision, "intent", None)
     )
+    query_mode = (
+        route_decision.get("query_mode")
+        if isinstance(route_decision, dict)
+        else getattr(route_decision, "query_mode", None)
+    )
     data_status = getattr(analysis, "data_status", None)
     context = getattr(analysis, "context", None)
     query_time_range = final_state.get("query_time_range")
     start_at = getattr(query_time_range, "start_at", None)
     end_at = getattr(query_time_range, "end_at", None)
     period_label = getattr(query_time_range, "label", None) or "当前会话"
+    if query_mode == "knowledge":
+        period_label = "不适用（概念解释）"
     if context is not None:
         start_ts = getattr(context, "start_ts", None)
         end_ts = getattr(context, "end_ts", None)
@@ -250,6 +262,9 @@ def _customer_answer_meta(
     elif route == "forecast":
         result_kind = "prediction"
         capability_state = "not_configured"
+    elif query_mode == "knowledge":
+        result_kind = "fact"
+        capability_state = "reference_only"
     elif route == "conversation":
         result_kind = "fact"
         capability_state = "reference_only"
@@ -264,7 +279,7 @@ def _customer_answer_meta(
     device_names = _answer_device_names(analysis)
     evidence_values = [
         CustomerAnswerEvidence(
-            label="数据快照",
+            label="回答时间" if query_mode == "knowledge" else "数据快照",
             value=snapshot_at.isoformat(timespec="seconds"),
         ),
         CustomerAnswerEvidence(
@@ -273,7 +288,11 @@ def _customer_answer_meta(
         ),
         CustomerAnswerEvidence(
             label="对象范围",
-            value="、".join(device_names) if device_names else "当前页面授权范围",
+            value=(
+                "通用工业知识"
+                if query_mode == "knowledge"
+                else "、".join(device_names) if device_names else "当前页面授权范围"
+            ),
         ),
         CustomerAnswerEvidence(
             label="指标口径",
@@ -281,7 +300,11 @@ def _customer_answer_meta(
         ),
         CustomerAnswerEvidence(
             label="数据状态",
-            value="仍在更新" if updating else "已完成快照",
+            value=(
+                "未读取当前设备数据"
+                if query_mode == "knowledge"
+                else "仍在更新" if updating else "已完成快照"
+            ),
         ),
     ]
     return CustomerAnswerMeta(
@@ -724,6 +747,21 @@ def chat(
                 if isinstance(route_decision, dict)
                 else getattr(route_decision, "intent", None)
             )
+            debug_query_mode = (
+                route_decision.get("query_mode")
+                if isinstance(route_decision, dict)
+                else getattr(route_decision, "query_mode", None)
+            )
+            debug_domain = (
+                route_decision.get("domain")
+                if isinstance(route_decision, dict)
+                else getattr(route_decision, "domain", None)
+            )
+            debug_subject = (
+                route_decision.get("subject")
+                if isinstance(route_decision, dict)
+                else getattr(route_decision, "subject", None)
+            )
             answer_meta = _customer_answer_meta(final_state, payload, snapshot_at)
             yield sse("message", {
                 "request_id": request_id,
@@ -739,6 +777,9 @@ def chat(
                         "intent": (
                             debug_intent
                         ),
+                        "query_mode": debug_query_mode,
+                        "domain": debug_domain,
+                        "subject": debug_subject,
                         "selected_capabilities": (
                             final_state.get("selected_power_capabilities")
                             or final_state.get("selected_capabilities")
@@ -766,7 +807,10 @@ def chat(
                         details=AssistantAnswerAuditDetails(
                             thread_id=payload.thread_id,
                             route=final_state.get("route"),
+                            query_mode=debug_query_mode,
+                            domain=debug_domain,
                             intent=debug_intent,
+                            subject=debug_subject,
                             capabilities=list(selected_capabilities),
                             data_snapshot_at=snapshot_at,
                             data_cutoff_at=answer_meta.data_cutoff_at,
