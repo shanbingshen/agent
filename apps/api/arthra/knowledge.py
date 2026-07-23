@@ -65,7 +65,7 @@ def search_knowledge(
     vector = embed_texts([query])[0]
     distance = KnowledgeChunk.embedding.cosine_distance(vector)
     statement = (
-        select(KnowledgeChunk, distance.label("distance"))
+        select(KnowledgeChunk, distance.label("distance"), KnowledgeDocument)
         .join(KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id)
         .where(KnowledgeChunk.embedding.is_not(None))
         .order_by(distance)
@@ -80,8 +80,9 @@ def search_knowledge(
         KnowledgeSearchResult(
             chunk_id=chunk.id,
             document_id=chunk.document_id,
+            document_name=document.filename,
             content=chunk.content,
             score=round(1 - float(item_distance), 4),
         )
-        for chunk, item_distance in rows
+        for chunk, item_distance, document in rows
     ]

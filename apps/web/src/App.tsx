@@ -217,7 +217,7 @@ function Login({ onLogin }: { onLogin: (token: string) => void }) {
     event.preventDefault();
     setBusy(true); setError("");
     try {
-      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api/v1"}/auth/login`, {
+      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL || "http://localhost:18089/api/v1"}/auth/login`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password }),
       });
       if (!response.ok) throw new Error("登录失败，请检查账号和密码");

@@ -1,10 +1,14 @@
 # Arthra Agent 开发约定
 
-本文件适用于整个仓库。任何开发者或编码 Agent 在修改代码前必须阅读并遵守。
+本项目本地同时与云端 https://github.com/shanbingshen/arthrarthra-AI-agent 和 https://github.com/AethraVolt/aethracore-ai 连接，前者是与另一个开发者共同合作，后者只是个备份（版本落后）。拉取默认从前者拉取，PR时需我确认PR到哪个。
 
 ## 系统边界
 
-- `apps/api/arthra/agent.py` 只负责能力路由、专家状态和语言解释；确定性计算不得交给 LLM。
+- `agents/main-agent` 是主 Agent 的目标归属；迁移期间 `apps/api/arthra/agent.py` 是兼容门面。两者只负责能力路由、专家状态和语言解释；确定性计算不得交给 LLM。
+- `apps/arthra-gateway` 负责外部 HTTP/SSE、认证、租户授权与线程归属；`apps/arthra-orchestrator` 负责图运行时；`apps/arthra-scheduler` 负责日报与定时任务。
+- `knowledge` 是知识资产目录；`packages/rag` 是 RAG 引擎代码。禁止把 PDF/DOCX/Markdown 加载、切分、Embedding、向量库查询或重排逻辑写入 Agent 目录。
+- Agent 必须通过 `arthra_rag.retrieve(...)`、RAG Tool 或 Orchestrator 受控节点检索知识，并遵守自身 `config.yaml` 的 `knowledge_sources`。客户知识检索必须同时携带 `tenant_id` 与 `factory_id`。
+- `mcp-servers/energy-data` 只允许暴露已授权范围内的只读工业数据工具和资源。任何控制 MCP Server 都不得绕过 `ControlService` 的 proposed/审批/审计状态机。
 - `apps/api/arthra/thingsboard.py` 是唯一允许持有 ThingsBoard 管理凭据的模块。
 - Agent、领域上下文、日报和只读 API 只能通过 `apps/api/arthra/industrial_data` 读取工业数据；禁止直接依赖具体数据源客户端。
 - 新数据源必须实现 `IndustrialDataAdapter`，并在适配器边界转换为统一 Pydantic 模型；领域工具不得按 provider 分支。
@@ -25,6 +29,10 @@ pnpm --dir apps/web lint
 pnpm --dir apps/web build
 docker compose up -d --build
 ```
+
+新架构包位于 `agents/*/src`、`packages/*/src`、`apps/arthra-*/src` 与 `mcp-servers/*/src`。运行测试或本地服务时必须包含这些路径；`start-lr.command`、`start-lr-windows.ps1` 和 API Dockerfile 已配置该路径集。
+
+知识资产位于 `knowledge`，评测数据位于 `dataset`。这两个目录是日常维护入口，不再包在 `data/` 下。
 
 改动后至少运行受影响模块测试；修改公共 API、控制状态机、迁移或前端类型时运行完整测试和前端构建。
 

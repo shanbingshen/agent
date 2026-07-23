@@ -860,6 +860,16 @@ def conversation(state: AgentState) -> dict[str, Any]:
         response = (
             "你好，我是 Arthra 工业能源 AI 助手，可以帮你分析电表、用电趋势和空压机运行情况。"
         )
+    elif state.citations:
+        sources = "\n".join(
+            f"- 《{citation.title}》：{(citation.excerpt or '').strip()[:240]}"
+            for citation in state.citations[:3]
+        )
+        response = (
+            "我在当前工厂知识库中检索到以下相关资料。以下内容仅基于原文片段；"
+            "涉及设备状态、阈值或控制决策时，仍需结合实时数据与既有审批流程确认。\n\n"
+            f"{sources}"
+        )
     elif query_mode == "clarification":
         response = (
             "请再说明你是想了解概念，还是查询或分析设备数据。"
@@ -873,7 +883,7 @@ def conversation(state: AgentState) -> dict[str, Any]:
     return {
         "analysis": None,
         "warnings": [],
-        "citations": [],
+        "citations": state.citations,
         "response": response,
     }
 
@@ -2048,6 +2058,16 @@ def _synthesis_state(result: ModelSynthesisResult) -> dict[str, Any]:
     }
 
 
+def _append_knowledge_sources(response: str, citations: list[Citation]) -> str:
+    if not citations:
+        return response
+    lines = ["", "### 相关知识库资料"]
+    for citation in citations[:3]:
+        excerpt = (citation.excerpt or "").strip().replace("\n", " ")
+        lines.append(f"- 《{citation.title}》：{excerpt[:240]}")
+    return "\n".join([response, *lines])
+
+
 def synthesize(state: AgentState) -> dict[str, Any]:
     if state.clarification_question:
         return {"response": state.clarification_question}
@@ -2059,11 +2079,11 @@ def synthesize(state: AgentState) -> dict[str, Any]:
     if analysis.data_status == "no_scope":
         return {"response": f"已路由至「{expert}」，但尚未选择设备。请在输入框上方选择至少一台设备后重新分析。"}
     if isinstance(analysis, CompressorAnalysisResult):
-        deterministic_response = _render_compressor_response(
+        deterministic_response = _append_knowledge_sources(_render_compressor_response(
             analysis,
             debug=state.presentation_mode == "debug",
             intent=intent,
-        )
+        ), state.citations)
         return _synthesis_state(
             _render_response_with_llm(
                 state,
@@ -2072,11 +2092,11 @@ def synthesize(state: AgentState) -> dict[str, Any]:
             )
         )
     if isinstance(analysis, PowerAnalysisResult):
-        deterministic_response = _render_power_response(
+        deterministic_response = _append_knowledge_sources(_render_power_response(
             analysis,
             debug=state.presentation_mode == "debug",
             intent=intent,
-        )
+        ), state.citations)
         return _synthesis_state(
             _render_response_with_llm(
                 state,
@@ -2084,10 +2104,10 @@ def synthesize(state: AgentState) -> dict[str, Any]:
                 deterministic_response,
             )
         )
-    deterministic_response = _render_generic_response(
+    deterministic_response = _append_knowledge_sources(_render_generic_response(
         analysis,
         debug=state.presentation_mode == "debug",
-    )
+    ), state.citations)
     return _synthesis_state(
         _render_response_with_llm(
             state,
@@ -2110,6 +2130,7 @@ def agent_checkpoint_serializer() -> JsonPlusSerializer:
             PowerAnalysisResult,
             PowerSystemContext,
             AnalysisWarning,
+            Citation,
             ConversationContext,
             ConversationTurn,
             QueryTimeRange,

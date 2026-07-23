@@ -1,0 +1,9 @@
+# Human-maintained standards metadata used by RAG ingestion.
+#
+# Example:
+# - domain: shared
+#   standard_id: GB/T-example
+#   title: Example energy management standard
+#   source_paths:
+#     - raw/shared/standards/example.md
+[]

@@ -341,6 +341,7 @@ class KnowledgeUploadResponse(StrictModel):
 class KnowledgeSearchResult(StrictModel):
     chunk_id: uuid.UUID
     document_id: uuid.UUID
+    document_name: str
     content: str
     score: float = Field(ge=-1, le=1)
 

@@ -1,0 +1,14 @@
+knowledge_sources:
+  - shared
+  - ems
+  - power
+  - compressor
+
+allowed_rag_domains:
+  - shared
+  - ems
+  - power
+  - compressor
+
+notes:
+  - Optimizer Agent must use deterministic expert outputs before proposing optimization.

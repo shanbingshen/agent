@@ -1,0 +1,9 @@
+# Human-maintained equipment metadata used by RAG ingestion.
+#
+# Example:
+# - domain: compressor
+#   manufacturer: Atlas Copco
+#   model: GA75
+#   source_paths:
+#     - raw/compressor/manuals/ga75.md
+[]

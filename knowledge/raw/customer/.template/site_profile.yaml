@@ -1,0 +1,5 @@
+# Customer site profile template. Copy under raw/customer/<customer_slug>/.
+customer_slug: example_customer
+tenant_id: 00000000-0000-0000-0000-000000000000
+factory_id: 00000000-0000-0000-0000-000000000000
+site_name: Example Factory

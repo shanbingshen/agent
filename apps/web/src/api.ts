@@ -1,4 +1,4 @@
-export const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api/v1";
+export const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:18089/api/v1";
 
 export type WorkspaceContext = "overview" | "demand" | "quality" | "compressor" | "carbon" | "events";
 export type ContextTimeScope = "realtime" | "today" | "yesterday" | "last_24h" | "last_7d" | "current_month";

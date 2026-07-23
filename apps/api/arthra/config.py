@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     embedding_base_url: str = "https://api.openai.com/v1"
     embedding_model: str = "text-embedding-3-small"
     embedding_dimensions: int = 384
+    rag_retrieval_enabled: bool = True
+    rag_top_k: int = Field(default=4, ge=1, le=10)
+    rag_min_score: float = Field(default=0.2, ge=-1, le=1)
 
     thingsboard_url: str = "http://localhost:9090"
     thingsboard_username: str = "tenant@thingsboard.org"

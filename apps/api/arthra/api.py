@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
 
+from arthra_rag import retrieve_citations
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import Response, StreamingResponse
@@ -17,7 +18,7 @@ from arthra.compressor.analysis import CompressorAnalysisService
 from arthra.compressor.context import CompressorContextError
 from arthra.compressor.schemas import CompressorAnalysisRequest, CompressorAnalysisResult
 from arthra.config import get_settings
-from arthra.contracts import JsonObject
+from arthra.contracts import Citation, JsonObject
 from arthra.control import ControlService
 from arthra.daily_summary import DailySummaryError, generate_daily_summary
 from arthra.db import get_db
@@ -689,12 +690,26 @@ def chat(
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     graph = request.app.state.graph
+    knowledge_citations: list[Citation] = []
+    if settings.rag_retrieval_enabled:
+        try:
+            knowledge_citations = retrieve_citations(
+                db,
+                payload.message,
+                limit=settings.rag_top_k,
+                min_score=settings.rag_min_score,
+                tenant_id=user.tenant_id,
+                factory_id=factory_id,
+            )
+        except Exception:
+            logger.exception("Knowledge retrieval failed; continuing without RAG context")
     graph_payload = {
         "message": payload.message,
         "device_scope": device_scope,
         "presentation_mode": "debug" if payload.debug else "customer",
         "page_workspace": payload.page_context.workspace if payload.page_context else None,
         "page_time_scope": payload.page_context.time_scope if payload.page_context else None,
+        "citations": knowledge_citations,
     }
     request_id = payload.request_id or str(uuid.uuid4())
     trace_id = current_trace_id()

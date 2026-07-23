@@ -1,0 +1,10 @@
+# Human-maintained customer knowledge metadata.
+#
+# Customer knowledge must always be indexed with tenant_id and factory_id.
+# Example:
+# - customer_slug: customer_A
+#   tenant_id: 00000000-0000-0000-0000-000000000000
+#   factory_id: 00000000-0000-0000-0000-000000000000
+#   source_paths:
+#     - raw/customer/customer_A/reports/example.md
+[]
