@@ -119,7 +119,9 @@ def test_model_identity_uses_product_identity_without_exposing_base_model(monkey
 def test_semantic_route_uses_validated_qwen_decision(monkeypatch):
     class FakeResponse:
         content = """```json
-        {"route":"compressor","confidence":0.94,"reason":"涉及卸载和供气","capabilities":["idle_running"]}
+        {"query_mode":"analysis","domain":"compressor","intent":"COMPRESSOR_UNLOAD_ANALYSIS",
+        "subject":"卸载和供气","requires_industrial_data":true,"needs_clarification":false,
+        "confidence":0.94,"reason":"涉及卸载和供气","capabilities":["idle_running"]}
         ```"""
 
     class FakeModel:
@@ -139,6 +141,9 @@ def test_semantic_route_uses_validated_qwen_decision(monkeypatch):
     decision = classify_route("1号机最近一直卸载，帮我看看供气情况", ["device-1"])
 
     assert decision.route == "compressor"
+    assert decision.query_mode == "analysis"
+    assert decision.domain == "compressor"
+    assert decision.intent == "COMPRESSOR_UNLOAD_ANALYSIS"
     assert decision.source == "qwen"
     assert decision.capabilities == ["idle_running"]
 
@@ -171,7 +176,12 @@ def test_registered_question_skips_semantic_model_even_when_it_would_return_inva
 
 def test_semantic_route_applies_deterministic_domain_guard(monkeypatch):
     class FakeResponse:
-        content = '{"route":"ems","confidence":0.96,"reason":"general energy request","capabilities":[]}'
+        content = (
+            '{"query_mode":"analysis","domain":"ems","intent":"GENERAL_ENERGY_ANALYSIS",'
+            '"subject":"compressor load rate","requires_industrial_data":true,'
+            '"needs_clarification":false,"confidence":0.96,'
+            '"reason":"general energy request","capabilities":[]}'
+        )
 
     class FakeModel:
         def __init__(self, **kwargs):
@@ -189,8 +199,49 @@ def test_semantic_route_applies_deterministic_domain_guard(monkeypatch):
     decision = classify_route("analyze compressor load rate", ["compressor-1"])
 
     assert decision.route == "compressor"
+    assert decision.domain == "compressor"
     assert decision.source == "hybrid_guard"
     assert decision.confidence == 0.96
+
+
+def test_generic_knowledge_question_uses_qwen_explanation_without_reading_devices(
+    monkeypatch,
+):
+    class FakeResponse:
+        content = (
+            '{"answer":"比功率表示空压机生产单位压缩空气所需的输入功率，常用单位为 '
+            'kW/(m³/min)。比较时应统一供气压力和流量基准。"}'
+        )
+
+    class FakeModel:
+        def __init__(self, **kwargs):
+            assert kwargs["temperature"] == 0
+
+        def invoke(self, prompt):
+            assert "不查询或声称读取了当前设备" in str(prompt)
+            return FakeResponse()
+
+    def unexpected_loader(device_ids):
+        raise AssertionError("知识解释不应读取工业数据")
+
+    monkeypatch.setattr(
+        "arthra.agent.get_settings",
+        lambda: Settings(llm_api_key="test-key"),
+    )
+    monkeypatch.setattr("arthra.agent.ChatOpenAI", FakeModel)
+    graph = build_graph(telemetry_loader=unexpected_loader)
+
+    result = graph.invoke(
+        {"message": "什么是比功率？", "device_scope": ["compressor-1"]},
+        {"configurable": {"thread_id": "knowledge-specific-power-test"}},
+    )
+
+    assert result["route"] == "conversation"
+    assert result["route_decision"]["query_mode"] == "knowledge"
+    assert result["route_decision"]["domain"] == "compressor"
+    assert result["route_decision"]["intent"] == "KNOWLEDGE_EXPLANATION"
+    assert result["analysis"] is None
+    assert "kW/(m³/min)" in result["response"]
 
 
 def test_graph_accepts_injected_semantic_classifier(monkeypatch):
