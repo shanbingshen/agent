@@ -116,15 +116,13 @@ AGENTS.md                Agent/开发者协作约束
 - 轻量调试：`start-lr.command`（macOS）或 `start-lr-windows.cmd`（Windows），使用 LR Python 环境、SQLite 临时库和 mock 工业数据，不需要 Docker、PostgreSQL 或 ThingsBoard。
 - 完整栈：`docker compose up -d --build`，启动 PostgreSQL、ThingsBoard、API、前端和模拟器。
 
-首次在新电脑运行前，先完成这些本地修改：
+首次在新电脑运行前，先完成这些本地准备：
 
 1. 安装 Python 3.12 环境并准备项目依赖。若使用现有命名，建议创建 `LR` 环境；脚本默认查找 macOS `/Users/aethravolt007/miniforge3/envs/LR/bin/python` 或 Windows `%USERPROFILE%\miniforge3\envs\LR\python.exe`。
 2. 安装 Node.js 与 pnpm，并执行 `pnpm --dir apps/web install`。
 3. 复制环境模板：`Copy-Item .env.example .env`（Windows PowerShell）或 `cp .env.example .env`（macOS/zsh）。
-4. 按本机实际路径修改启动脚本顶部的工具路径：
-   - macOS：修改 `start-lr.command` 里的 `ROOT`、`LR_PY`、`PNPM`、`NODE_BIN`。
-   - Windows：通常只需双击 `start-lr-windows.cmd`；如路径不同，可修改 `start-lr-windows.ps1` 顶部的 `$Root`、`$LrPython`、`$Pnpm`、`$NodeBin`，或用环境变量 `ARTHRA_ROOT`、`LR_PY`、`PNPM`、`NODE_BIN` 覆盖。
-5. 保持默认端口时无需再改前端配置：API 是 `18089`，Web 是 `18090`。如端口被占用，可在启动前设置 `API_PORT`、`WEB_PORT`；同时同步 `.env` 中的 `CORS_ORIGINS` 和 `VITE_API_BASE_URL`。
+4. 通常不需要修改启动脚本路径。macOS 脚本默认使用自身所在目录作为项目根目录；Windows 的 `start-lr-windows.cmd` 会把自身目录传给 PowerShell 脚本。若工具路径不同，可在启动前用环境变量覆盖：`ARTHRA_ROOT`、`LR_PY`、`PNPM`、`NODE_BIN`。
+5. 保持默认端口时无需再改前端配置：API 是 `18089`，Web 是 `18090`。如端口被占用，可在启动前设置 `API_PORT`、`WEB_PORT`；轻量脚本会同步设置运行时 `CORS_ORIGINS` 和 `VITE_API_BASE_URL`。
 
 Windows 轻量启动：
 
@@ -144,7 +142,7 @@ chmod +x ./start-lr.command
 - Arthra 控制台：[http://127.0.0.1:18090](http://127.0.0.1:18090)
 - Arthra API/Swagger：[http://127.0.0.1:18089/docs](http://127.0.0.1:18089/docs)
 
-如果登录页出现 `Failed to fetch`，优先检查后端是否已经启动成功：打开 [http://127.0.0.1:18089/api/v1/health](http://127.0.0.1:18089/api/v1/health)，再查看 `.local-dev/logs/api-lr*.log` 和 `.local-dev/logs/web-lr*.log`。
+启动成功后脚本会自动打开前端控制台；如果自动打开失败，终端会打印可手动访问的 URL。macOS 脚本会在 Vite/esbuild 因本地签名问题无法执行时尝试自动修复。若登录页出现 `Failed to fetch`，优先检查后端是否已经启动成功：打开 [http://127.0.0.1:18089/api/v1/health](http://127.0.0.1:18089/api/v1/health)，再查看 `.local-dev/logs/api-lr*.log` 和 `.local-dev/logs/web-lr*.log`。
 
 ## Docker 一键启动
 

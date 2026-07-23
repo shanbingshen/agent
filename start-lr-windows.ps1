@@ -71,7 +71,8 @@ function Wait-ForUrl {
   param(
     [string]$Url,
     [string]$Name,
-    [string]$LogFile
+    [string]$LogFile,
+    $Job = $null
   )
   for ($Attempt = 1; $Attempt -le 60; $Attempt++) {
     try {
@@ -82,6 +83,14 @@ function Wait-ForUrl {
       }
     } catch {
       Start-Sleep -Seconds 1
+    }
+    if ($null -ne $Job -and $Job.State -ne "Running") {
+      Write-Host ""
+      Write-Host "$Name 启动日志："
+      if (Test-Path -LiteralPath $LogFile) {
+        Get-Content -LiteralPath $LogFile -Tail 80
+      }
+      Fail "$Name 已退出，未能就绪"
     }
   }
   Write-Host ""
@@ -100,6 +109,26 @@ function Stop-JobIfRunning {
   }
 }
 
+function Test-FrontendToolchain {
+  param(
+    [string]$PnpmExe,
+    [string]$NodeDirectory,
+    [string]$WebRoot
+  )
+  $OldPath = $env:PATH
+  try {
+    if (-not [string]::IsNullOrWhiteSpace($NodeDirectory)) {
+      $env:PATH = "$NodeDirectory;$env:PATH"
+    }
+    & $PnpmExe --dir $WebRoot exec vite --version *> $null
+    if ($LASTEXITCODE -ne 0) {
+      Fail "前端 Vite 无法执行。请先执行：pnpm --dir `"$WebRoot`" install"
+    }
+  } finally {
+    $env:PATH = $OldPath
+  }
+}
+
 try {
   Set-Location -LiteralPath $Root
   New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
@@ -112,8 +141,12 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $NodeBin "node.exe"))) {
       Fail "NODE_BIN 中找不到 node.exe：$NodeBin"
     }
-  } elseif ($null -eq (Get-Command node -ErrorAction SilentlyContinue)) {
-    Fail "找不到 Node.js。请安装 Node.js，或设置 NODE_BIN 指向 node.exe 所在目录。"
+  } else {
+    $NodeCommand = Get-Command node -ErrorAction SilentlyContinue
+    if ($null -eq $NodeCommand) {
+      Fail "找不到 Node.js。请安装 Node.js，或设置 NODE_BIN 指向 node.exe 所在目录。"
+    }
+    $NodeBin = Split-Path -Parent $NodeCommand.Source
   }
 
   & $LrPython -c "import fastapi, sqlalchemy, langgraph, psycopg, uvicorn"
@@ -125,6 +158,8 @@ try {
   if (-not (Test-Path -LiteralPath $WebNodeModules)) {
     Fail "前端依赖未安装。请先执行：pnpm --dir `"$Root\apps\web`" install"
   }
+  $WebRoot = Join-Path $Root "apps\web"
+  Test-FrontendToolchain -PnpmExe $Pnpm -NodeDirectory $NodeBin -WebRoot $WebRoot
 
   if (Test-PortInUse -Port $ApiPort) {
     Fail "后端端口 $ApiPort 已被占用，请先关闭占用该端口的进程。"
@@ -185,11 +220,10 @@ try {
     & $Python -m uvicorn arthra.main:app --host $HostName --port $Port *> $LogFile
   }
 
-  Wait-ForUrl -Url "http://${ApiHost}:$ApiPort/api/v1/health" -Name "后端 API" -LogFile $ApiLog
+  Wait-ForUrl -Url "http://${ApiHost}:$ApiPort/api/v1/health" -Name "后端 API" -LogFile $ApiLog -Job $script:ApiJob
 
   Say-Step "启动前端控制台：http://${WebHost}:$WebPort"
   $ApiBaseUrl = "http://${BrowserApiHost}:$ApiPort/api/v1"
-  $WebRoot = Join-Path $Root "apps\web"
   $script:WebJob = Start-Job -Name "arthra-web-lr" -ArgumentList $Pnpm, $NodeBin, $WebRoot, $WebHost, $WebPort, $ApiBaseUrl, $WebLog -ScriptBlock {
     param($PnpmExe, $NodeDirectory, $AppDir, $HostName, $Port, $ApiUrl, $LogFile)
     if (-not [string]::IsNullOrWhiteSpace($NodeDirectory)) {
@@ -199,7 +233,7 @@ try {
     & $PnpmExe --dir $AppDir exec vite --host $HostName --port $Port *> $LogFile
   }
 
-  Wait-ForUrl -Url "http://${WebHost}:$WebPort/" -Name "前端控制台" -LogFile $WebLog
+  Wait-ForUrl -Url "http://${WebHost}:$WebPort/" -Name "前端控制台" -LogFile $WebLog -Job $script:WebJob
 
   Write-Host ""
   Write-Host "Arthra LR Windows 本地调试环境已启动。"
@@ -218,7 +252,11 @@ try {
   Write-Host "关闭这个窗口或按 Ctrl+C 会停止本次启动的服务。"
 
   if ($OpenBrowser -eq "1") {
-    Start-Process "http://${WebHost}:$WebPort" | Out-Null
+    try {
+      Start-Process "http://${WebHost}:$WebPort" | Out-Null
+    } catch {
+      Write-Host "无法自动打开浏览器，请手动访问：http://${WebHost}:$WebPort"
+    }
   }
 
   while ($true) {

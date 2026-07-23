@@ -73,6 +73,24 @@ class FactoryAccessGrant(StrictModel):
     can_manage_devices: bool = False
 
 
+class LoadForecastPoint(StrictModel):
+    label: str = Field(min_length=1, max_length=32)
+    actual_mw: float | None = Field(default=None, ge=0)
+    ai_prediction_mw: float = Field(ge=0)
+    baseline_mw: float = Field(ge=0)
+    limit_mw: float = Field(ge=0)
+
+
+class LoadForecastMockResponse(StrictModel):
+    unit: Literal["MW"] = "MW"
+    source: Literal["mock"] = "mock"
+    model_name: str = Field(default="mock-deep-learning-placeholder", min_length=1, max_length=80)
+    confidence: float = Field(ge=0, le=1)
+    peak_prediction_mw: float = Field(ge=0)
+    risk_window: str = Field(min_length=1, max_length=64)
+    points: list[LoadForecastPoint] = Field(min_length=1, max_length=96)
+
+
 class ChatPageContext(StrictModel):
     factory_id: uuid.UUID | None = None
     selected_device_ids: list[str] = Field(default_factory=list, max_length=100)

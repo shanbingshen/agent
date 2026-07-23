@@ -86,6 +86,28 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 1px
 .insight-detail dl { display: grid; margin: 14px 0 0; border: 1px solid #26393c; }.insight-detail dl div { min-width: 0; min-height: 34px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(80px, auto); align-items: center; gap: 10px; padding: 7px 9px; border-bottom: 1px solid #223336; }.insight-detail dl div:last-child { border-bottom: 0; }.insight-detail dt { color: #849b97; font-size: 10px; }.insight-detail dd { min-width: 0; margin: 0; color: #dce9e7; text-align: right; overflow-wrap: anywhere; font-size: 11px; }.insight-detail dd.cyan { color: var(--cyan); }.insight-detail dd.green { color: var(--green); }.insight-detail dd.amber { color: var(--amber); }
 .insight-evidence-panel { display: grid; gap: 8px; margin-top: 12px; border-left: 2px solid #2e7e79; background: #0d2021; padding: 10px; }.insight-evidence-panel > strong { color: var(--cyan); font-size: 10px; font-weight: 500; }.insight-evidence-panel div { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; align-items: start; }.insight-evidence-panel span { color: #718783; font-size: 9px; }.insight-evidence-panel b { color: #aec1bd; overflow-wrap: anywhere; font-size: 9px; font-weight: 400; line-height: 1.45; }
 .insight-detail footer { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 13px; }.insight-detail footer button { min-height: 40px; border: 1px solid #35484c; border-radius: 6px; background: #111d20; color: #bdcbc8; padding: 7px 8px; font-size: 10px; }.insight-detail footer button:hover, .insight-detail footer button.selected { border-color: var(--cyan); color: var(--cyan); background: #10282a; }
+.daily-insight-shell .insight-detail, .daily-insight-shell:nth-child(n+3) .insight-detail { position: static; width: auto; max-height: none; overflow: visible; border: 1px solid #173037; border-top: 0; border-radius: 0 0 8px 8px; background: #061116; padding: 12px; box-shadow: none; backdrop-filter: none; animation: daily-drop 180ms ease-out; }
+.daily-insight-shell.open .insight-card { border-bottom-color: #173037; }
+.daily-insight-body { display: grid; gap: 10px; color: #a8bbbd; font-size: 11px; line-height: 1.6; }
+.daily-insight-body p { margin: 0; color: #9fb1b3; }
+.daily-value { color: #9cadad; }
+.daily-value b { display: block; margin-top: 6px; color: var(--cyan); font-size: 21px; font-weight: 500; }
+.daily-value small, .daily-month small { color: #9cadad; font-size: 10px; font-weight: 400; }
+.daily-value em { float: right; color: var(--green); font-style: normal; font-size: 11px; }
+.daily-spark { height: 98px; border-left: 1px solid #28515a; border-bottom: 1px solid #28515a; background: repeating-linear-gradient(0deg, transparent 0 25px, #173139 26px); }
+.daily-spark svg { width: 100%; height: 100%; display: block; }
+.daily-month { color: #8da0a2; font-size: 10px; }
+.daily-month b { display: block; color: var(--cyan); font-size: 17px; font-weight: 500; }
+.daily-month span { display: block; margin-top: 3px; color: #72878a; font-size: 9px; }
+.daily-kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.daily-kpis span { min-width: 0; padding: 7px 5px; border: 1px solid #173b43; background: #081b20; text-align: center; color: #879b9e; font-size: 9px; }
+.daily-kpis b { display: block; margin-top: 3px; color: var(--cyan); font-size: 13px; font-weight: 500; }
+.daily-kpis .amber { color: var(--amber); }
+.daily-list { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.daily-list li { min-height: 30px; padding: 7px 8px; border-left: 2px solid var(--cyan); background: #081b20; color: #aebfc0; font-size: 10px; }
+.daily-list.risk li:first-child { border-color: var(--amber); }
+.daily-list em { float: right; color: var(--amber); font-style: normal; }
+@keyframes daily-drop { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
 
 .main-stage { min-width: 0; padding: 28px clamp(18px, 3vw, 46px) 25px; }
 .stage-loading { min-height: 70vh; display: grid; place-content: center; justify-items: center; gap: 15px; color: var(--muted); font-size: 12px; }
@@ -113,6 +135,27 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 1px
 .trend-panel { min-height: 290px; padding: 23px; }.section-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }.section-head p, .domain-heading p { color: var(--cyan); font-size: 10px; letter-spacing: .16em; margin: 0 0 6px; }.section-head h3 { margin: 0; font-size: 16px; font-weight: 500; }.section-head span { color: var(--muted); font-size: 10px; }
 .load-bars { height: 185px; display: flex; align-items: end; gap: 3px; margin-top: 25px; padding-top: 8px; border-bottom: 1px solid #234047; background: repeating-linear-gradient(to bottom, transparent 0, transparent 44px, #173139 45px); }
 .load-bars i { flex: 1; min-width: 2px; background: linear-gradient(to top, #0f7583, var(--cyan)); opacity: .78; box-shadow: 0 0 7px #15c3d744; }.load-bars i:hover { opacity: 1; }
+.interactive-chart { position: relative; cursor: crosshair; }
+.chart-guide { position: absolute; z-index: 4; top: 0; bottom: 0; width: 1px; background: #8ff7ff; box-shadow: 0 0 10px #16d7e8; pointer-events: none; }
+.chart-dot { position: absolute; z-index: 5; width: 9px; height: 9px; margin: -4px 0 0 -4px; border: 2px solid #f8ffff; border-radius: 50%; pointer-events: none; }
+.chart-tooltip { position: absolute; z-index: 7; min-width: 148px; transform: translate(10px, -100%); border: 1px solid #2c6b72; border-radius: 7px; background: #071114f5; box-shadow: 0 14px 30px #000c; color: #dff8f7; padding: 9px 10px; pointer-events: none; font-size: 10px; line-height: 1.5; }
+.chart-tooltip.right { transform: translate(calc(-100% - 10px), -100%); }
+.chart-tooltip strong { display: block; margin-bottom: 5px; color: var(--cyan); font-size: 11px; font-weight: 500; }
+.chart-tooltip span { display: grid; grid-template-columns: 10px 1fr auto; gap: 6px; align-items: center; white-space: nowrap; color: #9fb3b5; }
+.chart-tooltip span i { width: 7px; height: 7px; border-radius: 50%; }
+.chart-tooltip span b { color: #edfdfb; font-weight: 500; }
+.forecast-panel .section-head span { max-width: 260px; text-align: right; line-height: 1.4; }
+.forecast-legend { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 13px; margin-top: 12px; color: #96aaad; font-size: 10px; }
+.forecast-legend span { display: flex; align-items: center; gap: 6px; }
+.forecast-legend i { width: 28px; height: 0; border-top: 2px solid currentColor; }
+.forecast-legend .dash { border-top-style: dashed; }
+.forecast-legend .cyan { color: var(--cyan); }.forecast-legend .light { color: #e3fbff; }.forecast-legend .muted { color: #8b9da0; }.forecast-legend .amber { color: var(--amber); }
+.forecast-chart { height: 185px; margin-top: 13px; border-bottom: 1px solid #234047; background: repeating-linear-gradient(to bottom, transparent 0, transparent 44px, #173139 45px); }
+.forecast-chart svg { width: 100%; height: 100%; display: block; overflow: visible; }
+.forecast-stats { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid #18343a; border-top: 0; }
+.forecast-stats span { min-width: 0; padding: 10px 12px; border-right: 1px solid #18343a; color: #89a0a3; font-size: 10px; }
+.forecast-stats span:last-child { border-right: 0; }
+.forecast-stats b { display: block; margin-top: 4px; color: var(--cyan); font-size: 15px; font-weight: 500; }
 .chart-empty { min-height: 185px; display: grid; place-items: center; color: var(--muted); font-size: 12px; }
 .chart-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; margin-top: 10px; }
 .metric-rail { display: grid; align-content: start; }.metric-tile { padding: 19px 18px; border-bottom: 1px solid #142a2f; min-width: 0; }.metric-tile:last-child { border-bottom: 0; }.metric-tile header { display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 11px; }.metric-tile header i { color: var(--cyan); font-style: normal; font-size: 17px; }.metric-tile strong { display: block; margin-top: 12px; font-size: 25px; font-weight: 500; white-space: nowrap; }.metric-tile strong small { color: var(--muted); font-size: 10px; font-weight: 400; }.metric-tile p { color: var(--muted); margin: 8px 0 0; font-size: 10px; line-height: 1.45; }.metric-tile.green header i, .metric-tile.green strong { color: var(--green); }.metric-tile.amber header i, .metric-tile.amber strong { color: var(--amber); }
@@ -151,3 +194,4 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 1px
 @media (max-width: 560px) { .assistant-drawer { inset: 8px; width: auto; height: calc(100vh - 16px); border-radius: 16px; }.assistant-drawer > header { min-height: 108px; padding: 14px; }.assistant-drawer header strong { font-size: 17px; }.assistant-context-summary { max-width: calc(100vw - 125px); }.assistant-context-panel { grid-template-columns: 1fr; padding: 10px 14px; }.assistant-context-panel p { grid-column: 1; }.assistant-messages { padding: 16px 16px 34px; }.message-actions { flex-wrap: wrap; }.assistant-answer-evidence > div { grid-template-columns: 68px minmax(0, 1fr); }.assistant-composer { margin: 0 12px 12px; }.assistant-composer > div small { display: none; }.assistant-back-latest { right: 20px; bottom: 140px; }.assistant-suggestions button { min-height: 58px; }.assistant-welcome { grid-template-columns: 44px 1fr; }.assistant-welcome > i { width: 44px; height: 44px; }.assistant-message.you { width: 94%; } }
 @media (max-width: 560px) { .insight-list { grid-template-columns: 1fr; }.insight-card { min-height: 68px; }.insight-detail footer { grid-template-columns: 1fr 1fr; }.insight-detail dl div { grid-template-columns: minmax(0, 1fr) minmax(70px, auto); } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }.assistant-suggestions button:hover { transform: none; } }
+.daily-insight-shell .insight-detail, .daily-insight-shell:nth-child(n+3) .insight-detail { position: static; left: auto; top: auto; bottom: auto; width: auto; max-height: none; transform: none; }

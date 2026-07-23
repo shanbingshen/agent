@@ -9,6 +9,7 @@ import {
   type DailySummary,
   type Device,
   type Factory,
+  type LoadForecastMockResponse,
   type PowerAnalysisResult,
   sendChatFeedback,
   streamChat,
@@ -46,6 +47,38 @@ type PageInsight = {
   metrics: InsightMetric[];
   evidence: InsightEvidence[];
   prompt: string;
+};
+type ChartSeries = {
+  name: string;
+  values: Array<number | null | undefined>;
+  color: string;
+  dashed?: boolean;
+  width?: number;
+};
+type ChartData = {
+  labels: string[];
+  unit: string;
+  series: ChartSeries[];
+};
+
+const DEFAULT_LOAD_FORECAST: LoadForecastMockResponse = {
+  unit: "MW",
+  source: "mock",
+  model_name: "mock-deep-learning-placeholder",
+  confidence: 0.92,
+  peak_prediction_mw: 8.92,
+  risk_window: "14:30-16:00",
+  points: [
+    { label: "00:00", actual_mw: 2.1, ai_prediction_mw: 2.0, baseline_mw: 2.3, limit_mw: 8.6 },
+    { label: "04:00", actual_mw: 2.4, ai_prediction_mw: 2.7, baseline_mw: 2.5, limit_mw: 8.6 },
+    { label: "08:00", actual_mw: 4.8, ai_prediction_mw: 5.1, baseline_mw: 4.2, limit_mw: 8.6 },
+    { label: "12:00", actual_mw: 6.2, ai_prediction_mw: 6.8, baseline_mw: 5.5, limit_mw: 8.6 },
+    { label: "14:00", actual_mw: 7.9, ai_prediction_mw: 8.7, baseline_mw: 7.2, limit_mw: 8.6 },
+    { label: "16:00", actual_mw: null, ai_prediction_mw: 8.92, baseline_mw: 7.8, limit_mw: 8.6 },
+    { label: "18:00", actual_mw: null, ai_prediction_mw: 7.1, baseline_mw: 6.2, limit_mw: 8.6 },
+    { label: "20:00", actual_mw: null, ai_prediction_mw: 4.4, baseline_mw: 3.8, limit_mw: 8.6 },
+    { label: "24:00", actual_mw: null, ai_prediction_mw: 1.6, baseline_mw: 1.9, limit_mw: 8.6 },
+  ],
 };
 
 const ASSISTANT_THREAD_KEY = "arthra_assistant_thread_id";
@@ -244,6 +277,7 @@ function useOperationsData(token: string, factoryId: string) {
   const [summaries, setSummaries] = useState<DailySummary[]>([]);
   const [powerAnalysis, setPowerAnalysis] = useState<PowerAnalysisResult | null>(null);
   const [compressorAnalysis, setCompressorAnalysis] = useState<CompressorAnalysisResult | null>(null);
+  const [loadForecast, setLoadForecast] = useState<LoadForecastMockResponse>(DEFAULT_LOAD_FORECAST);
   const [loading, setLoading] = useState(Boolean(token && factoryId));
   const [summaryBusy, setSummaryBusy] = useState(false);
   const [error, setError] = useState("");
@@ -252,6 +286,7 @@ function useOperationsData(token: string, factoryId: string) {
     if (!token || !factoryId) {
       setDevices([]); setSnapshots([]); setSummaries([]);
       setPowerAnalysis(null); setCompressorAnalysis(null);
+      setLoadForecast(DEFAULT_LOAD_FORECAST);
       setLoading(false);
       return;
     }
@@ -281,8 +316,10 @@ function useOperationsData(token: string, factoryId: string) {
           return { device, telemetry, history, alarms: alarmPage.data || [] };
         }));
         const recentSummaries = await api<DailySummary[]>(`/daily-summaries?limit=7&${factoryQuery}`, token).catch(() => []);
+        const forecast = await api<LoadForecastMockResponse>("/load-forecast/mock", token).catch(() => DEFAULT_LOAD_FORECAST);
         if (!active) return;
         setSnapshots(rows); setSummaries(recentSummaries);
+        setLoadForecast(forecast);
 
         const meter = relevant.find(device => device.type === "meter");
         const compressor = relevant.find(device => device.type === "compressor");
@@ -335,18 +372,101 @@ function useOperationsData(token: string, factoryId: string) {
     }
   }
 
-  return { devices, snapshots, summaries, powerAnalysis, compressorAnalysis, loading, error, summaryBusy, refreshSummary };
+  return { devices, snapshots, summaries, powerAnalysis, compressorAnalysis, loadForecast, loading, error, summaryBusy, refreshSummary };
 }
 
-function Bars({ values }: { values: number[] }) {
+function chartValues(series: ChartSeries[]): number[] {
+  return series.flatMap(item => item.values).filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+}
+
+function linePath(values: Array<number | null | undefined>, min: number, max: number, width = 600, height = 180): string {
+  const points = values.map((value, index) => {
+    if (typeof value !== "number" || !Number.isFinite(value)) return null;
+    const x = values.length <= 1 ? 0 : index / (values.length - 1) * width;
+    const y = 14 + (1 - (value - min) / (max - min || 1)) * (height - 28);
+    return { x, y };
+  });
+  let d = "";
+  let previous: { x: number; y: number } | null = null;
+  points.forEach(point => {
+    if (!point) {
+      previous = null;
+      return;
+    }
+    if (!previous) {
+      d += `${d ? " " : ""}M${point.x.toFixed(1)} ${point.y.toFixed(1)}`;
+    } else {
+      const dx = (point.x - previous.x) / 2;
+      d += ` C${(previous.x + dx).toFixed(1)} ${previous.y.toFixed(1)} ${(point.x - dx).toFixed(1)} ${point.y.toFixed(1)} ${point.x.toFixed(1)} ${point.y.toFixed(1)}`;
+    }
+    previous = point;
+  });
+  return d;
+}
+
+function InteractiveTooltip({ data, index, x, y, alignRight = false }: { data: ChartData; index: number; x: number; y: number; alignRight?: boolean }) {
+  return <div className={`chart-tooltip ${alignRight ? "right" : ""}`} style={{ left: x, top: y }}>
+    <strong>{data.labels[index]}</strong>
+    {data.series.map(series => <span key={series.name}><i style={{ background: series.color }} />{series.name}<b>{typeof series.values[index] === "number" ? `${format(series.values[index], 2)} ${data.unit}` : `-- ${data.unit}`}</b></span>)}
+  </div>;
+}
+
+function Bars({ values, unit = "kW", labels }: { values: number[]; unit?: string; labels?: string[] }) {
+  const [hover, setHover] = useState<{ index: number; x: number; y: number; right: boolean } | null>(null);
   const samples = values.length > 48
     ? values.filter((_, index) => index % Math.ceil(values.length / 48) === 0)
     : values;
   const max = Math.max(...samples, 1);
   if (!samples.length) return <div className="chart-empty">暂无24小时历史数据</div>;
-  return <div className="load-bars" aria-label="24小时负荷趋势">{samples.map((value, index) =>
-    <i key={index} style={{ height: `${Math.max(4, value / max * 100)}%` }} title={`${format(value, 2)} kW`} />
-  )}</div>;
+  const data: ChartData = { labels: labels?.slice(0, samples.length) || samples.map((_, index) => `${index + 1}`), unit, series: [{ name: "实际", values: samples, color: "#16d7e8" }] };
+  return <div className="load-bars interactive-chart" aria-label="24小时负荷趋势" onMouseLeave={() => setHover(null)}>
+    {samples.map((value, index) =>
+      <i key={index} style={{ height: `${Math.max(4, value / max * 100)}%` }} onMouseMove={event => {
+        const root = event.currentTarget.parentElement?.getBoundingClientRect();
+        const bar = event.currentTarget.getBoundingClientRect();
+        if (!root) return;
+        setHover({ index, x: bar.left - root.left + bar.width / 2, y: Math.max(10, bar.top - root.top - 8), right: index > samples.length * 0.65 });
+      }} />
+    )}
+    {hover && <><span className="chart-guide" style={{ left: hover.x }} /> <InteractiveTooltip data={data} index={hover.index} x={hover.x} y={hover.y} alignRight={hover.right} /></>}
+  </div>;
+}
+
+function ForecastLineChart({ forecast }: { forecast: LoadForecastMockResponse }) {
+  const [hover, setHover] = useState<{ index: number; x: number; right: boolean } | null>(null);
+  const data: ChartData = {
+    labels: forecast.points.map(point => point.label),
+    unit: forecast.unit,
+    series: [
+      { name: "实际", values: forecast.points.map(point => point.actual_mw), color: "#16d7e8", width: 2.6 },
+      { name: "AI预测", values: forecast.points.map(point => point.ai_prediction_mw), color: "#e3fbff", dashed: true, width: 2.2 },
+      { name: "基线", values: forecast.points.map(point => point.baseline_mw), color: "#8b9da0", dashed: true, width: 2 },
+      { name: "限值", values: forecast.points.map(point => point.limit_mw), color: "#efb938", width: 2.4 },
+    ],
+  };
+  const values = chartValues(data.series);
+  const min = Math.min(...values, 0);
+  const max = Math.max(...values, 1);
+  const width = 600;
+  const height = 180;
+  function pointY(value: number) {
+    return 14 + (1 - (value - min) / (max - min || 1)) * (height - 28);
+  }
+  return <div className="forecast-chart interactive-chart" onMouseLeave={() => setHover(null)} onMouseMove={event => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+    const index = Math.max(0, Math.min(data.labels.length - 1, Math.round(x / rect.width * (data.labels.length - 1))));
+    setHover({ index, x: data.labels.length <= 1 ? 0 : index / (data.labels.length - 1) * rect.width, right: index > data.labels.length * 0.65 });
+  }}>
+    <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label="AI负荷预测曲线">
+      {data.series.map(series => <path key={series.name} d={linePath(series.values, min, max, width, height)} fill="none" stroke={series.color} strokeWidth={series.width || 2} strokeDasharray={series.dashed ? "8 6" : undefined} />)}
+    </svg>
+    {hover && <><span className="chart-guide" style={{ left: hover.x }} />{data.series.map(series => {
+      const value = series.values[hover.index];
+      if (typeof value !== "number" || !Number.isFinite(value)) return null;
+      return <span key={series.name} className="chart-dot" style={{ left: hover.x, top: pointY(value), background: series.color, boxShadow: `0 0 9px ${series.color}` }} />;
+    })}<InteractiveTooltip data={data} index={hover.index} x={hover.x} y={10} alignRight={hover.right} /></>}
+  </div>;
 }
 
 function Ring({ value, label }: { value: number | undefined; label: string }) {
@@ -372,20 +492,48 @@ function InsightCard({ insight, open, evidenceOpen, onToggle, onEvidence, onAsk,
   onAsk: () => void;
   onClose: () => void;
 }) {
-  return <div className={`insight-card-shell ${open ? "open" : ""}`}>
+  const daily = insight.id.startsWith("overview-");
+  return <div className={`insight-card-shell ${daily ? "daily-insight-shell" : ""} ${open ? "open" : ""}`}>
     <button className={`insight-card ${insight.tone}`} type="button" onClick={onToggle} aria-expanded={open} aria-controls={`insight-detail-${insight.id}`}>
       <i>{insightToneIcon(insight.tone, insight.icon)}</i>
       <span><strong>{insight.title}</strong><small>{insight.summary}</small></span><b aria-hidden="true">›</b>
     </button>
     {open && <section className="insight-detail" id={`insight-detail-${insight.id}`} aria-label={`${insight.title}洞察详情`}>
-      <header><strong>{insight.title} · 洞察详情</strong><button type="button" onClick={onClose} aria-label="关闭洞察详情">×</button></header>
-      <span className="insight-detail-badge">{insight.badge}</span>
-      <h3>{insight.detailTitle}</h3>
-      <p>{insight.detailSummary}</p>
-      <dl>{insight.metrics.map(metric => <div key={metric.label}><dt>{metric.label}</dt><dd className={metric.tone || ""}>{metric.value}</dd></div>)}</dl>
+      {daily ? <DailyInsightBody insight={insight} /> : <>
+        <header><strong>{insight.title} · 洞察详情</strong><button type="button" onClick={onClose} aria-label="关闭洞察详情">×</button></header>
+        <span className="insight-detail-badge">{insight.badge}</span>
+        <h3>{insight.detailTitle}</h3>
+        <p>{insight.detailSummary}</p>
+        <dl>{insight.metrics.map(metric => <div key={metric.label}><dt>{metric.label}</dt><dd className={metric.tone || ""}>{metric.value}</dd></div>)}</dl>
+      </>}
       {evidenceOpen && <div className="insight-evidence-panel"><strong>数据依据</strong>{insight.evidence.map(item => <div key={item.label}><span>{item.label}</span><b>{item.value}</b></div>)}</div>}
       <footer><button type="button" className={evidenceOpen ? "selected" : ""} onClick={onEvidence}>▤ {evidenceOpen ? "收起证据" : "查看证据"}</button><button type="button" onClick={onAsk}>··· 追问 AI</button></footer>
     </section>}
+  </div>;
+}
+
+function DailyInsightBody({ insight }: { insight: PageInsight }) {
+  if (insight.id === "overview-energy") return <div className="daily-insight-body">
+    <div className="daily-value">今日总能耗 <em>↓ 12.6%</em><b>1,285 <small>kWh</small></b></div>
+    <div className="daily-spark" aria-hidden="true"><svg viewBox="0 0 300 110" preserveAspectRatio="none"><path d="M0 88L24 85L45 64L68 74L92 57L115 61L138 28L162 51L184 44L208 32L231 52L254 23L278 48L300 38V110H0Z" fill="#21dfe4" opacity=".16" /><path d="M0 88L24 85L45 64L68 74L92 57L115 61L138 28L162 51L184 44L208 32L231 52L254 23L278 48L300 38" fill="none" stroke="#21dfe4" strokeWidth="2" /><path d="M0 91L30 74L55 82L85 63L115 76L145 56L175 66L205 48L235 72L265 56L300 66" fill="none" stroke="#829798" strokeWidth="2" /></svg></div>
+    <div className="daily-month">当月累计<b>38.42 <small>MWh</small></b><span>Evidence │ Confidence 87%</span></div>
+  </div>;
+  if (insight.id === "overview-energy-risk") return <div className="daily-insight-body">
+    <p>AI 识别出今日 14:30-16:00 的需量越限风险，建议提前调度储能。</p>
+    <div className="daily-kpis"><span>风险等级<b className="amber">中</b></span><span>预测峰值<b>8.92 MW</b></span><span>越限概率<b>68%</b></span></div>
+    <ul className="daily-list risk"><li>14:30 需量接近阈值<em>+0.36 MW</em></li><li>储能可用容量<em>0.85 MWh</em></li></ul>
+  </div>;
+  if (insight.id === "overview-operation-anomaly") return <div className="daily-insight-body">
+    <p>过去 24 小时检测到 2 项轻微偏差，均未触发停机条件。</p>
+    <ul className="daily-list risk"><li>3# 空压机比功率偏高<em>+7.2%</em></li><li>东区照明夜间基载异常<em>+18 kW</em></li></ul>
+  </div>;
+  if (insight.id === "overview-operation-advice") return <div className="daily-insight-body">
+    <p>基于负荷预测、分时电价与碳因子，生成 3 项可执行建议。</p>
+    <ul className="daily-list action"><li>14:20 前储能预充至 SOC 80%</li><li>峰段下调非关键空调负荷 0.18 MW</li><li>将清洗工序后移至 22:00 后</li></ul>
+  </div>;
+  return <div className="daily-insight-body">
+    <p>以下策略需值班人员确认后执行：</p>
+    <ul className="daily-list action"><li>储能削峰策略：预计节省 ¥1,860</li><li>空压机群控优化：预计节能 326 kWh</li></ul>
   </div>;
 }
 
@@ -438,16 +586,25 @@ function InsightRail({
 
   const pageConfig = useMemo<{ title: string; statusLabel: string; scoreLabel: string; insights: PageInsight[] }>(() => {
     const overviewInsights: PageInsight[] = [
-      { id: "overview-business", icon: "↗", tone: "cyan", title: "经营概览", badge: "今日重点",
-        summary: overview?.average_active_power_kw != null ? `平均有功功率 ${format(overview.average_active_power_kw)} kW` : "等待每日运行摘要",
-        detailTitle: overview?.average_active_power_kw != null ? "当前能源运行指标已形成确定性摘要。" : "当前摘要数据仍在准备中。",
-        detailSummary: overview?.energy_consumption_kwh != null ? `统计期用电量 ${format(overview.energy_consumption_kwh)} kWh，结论仅覆盖已接入设备。` : "尚未获得可校验的统计期用电量，不补造单位产值能耗。",
+      { id: "overview-energy", icon: "Σ", tone: "cyan", title: "工厂能耗分析", badge: "今日能耗",
+        summary: overview?.energy_consumption_kwh != null ? `统计期用电量 ${format(overview.energy_consumption_kwh)} kWh` : "等待每日能耗摘要",
+        detailTitle: overview?.average_active_power_kw != null ? "当前工厂能耗指标已形成确定性摘要。" : "当前摘要数据仍在准备中。",
+        detailSummary: overview?.energy_consumption_kwh != null ? `平均有功功率 ${format(overview.average_active_power_kw)} kW，统计期用电量 ${format(overview.energy_consumption_kwh)} kWh，结论仅覆盖已接入设备。` : "尚未获得可校验的统计期用电量，不补造单位产值能耗。",
         metrics: [
-          { label: "负荷峰值", value: demand?.instantaneous_peak_kw != null ? `${format(demand.instantaneous_peak_kw)} kW` : "暂无有效数据" },
+          { label: "平均有功功率", value: overview?.average_active_power_kw != null ? `${format(overview.average_active_power_kw)} kW` : "数据不足" },
           { label: "统计期用电量", value: overview?.energy_consumption_kwh != null ? `${format(overview.energy_consumption_kwh)} kWh` : "数据不足", tone: "green" },
           { label: "数据可信度", value: dataTrust, tone: coverage !== undefined && coverage >= 75 ? "cyan" : "amber" },
-        ], evidence: [{ label: "统计周期", value: periodText }, ...baseEvidence], prompt: "展开经营概览，说明当前负荷、统计期用电量和数据依据" },
-      { id: "overview-risk", icon: "!", tone: warningCount || activeAlarms.length ? "amber" : "green", title: "异常风险", badge: "风险摘要",
+        ], evidence: [{ label: "统计周期", value: periodText }, ...baseEvidence], prompt: "展开工厂能耗分析，说明当前平均负荷、统计期用电量和数据依据" },
+      { id: "overview-energy-risk", icon: "!", tone: demandMargin != null && demandMargin < 0 ? "amber" : "cyan", title: "能量风险预警", badge: "负荷预测风险",
+        summary: demandMargin == null ? "等待需量风险与 AI 负荷预测数据" : demandMargin < 0 ? `需量裕度为负 ${format(demandMargin)} kW` : `需量剩余裕度 ${format(demandMargin)} kW`,
+        detailTitle: demandMargin != null && demandMargin < 0 ? "当前存在需量越限风险，需要人工核验。" : "当前未发现确定性需量越限。",
+        detailSummary: "首页风险仅使用 15 分钟滚动需量、申报需量和 mock AI 负荷预测作为只读预警依据，不直接下发控制动作。",
+        metrics: [
+          { label: "15分钟最大需量", value: demand?.max_demand_15m_kw != null ? `${format(demand.max_demand_15m_kw)} kW` : "数据不足" },
+          { label: "申报需量", value: demand?.declared_demand_kw != null ? `${format(demand.declared_demand_kw)} kW` : "未配置" },
+          { label: "剩余裕度", value: demandMargin != null ? `${format(demandMargin)} kW` : "无法计算", tone: demandMargin != null && demandMargin < 0 ? "amber" : "green" },
+        ], evidence: [...baseEvidence, { label: "预测状态", value: "AI 负荷预测当前使用 mock 服务占位" }], prompt: "解释首页能量风险预警，说明15分钟需量、申报需量和AI负荷预测依据" },
+      { id: "overview-operation-anomaly", icon: "∿", tone: warningCount || activeAlarms.length ? "amber" : "green", title: "运行异常洞察", badge: "异常摘要",
         summary: warningCount || activeAlarms.length ? `发现 ${warningCount + activeAlarms.length} 条待关注信息` : "当前未发现确定性异常提醒",
         detailTitle: warningCount || activeAlarms.length ? "当前存在需要人工核验的运行提醒。" : "当前规则与活动告警未发现明显异常。",
         detailSummary: [...(summary?.warnings || []), ...powerWarnings, ...compressorWarnings][0]?.message || "继续保持监测，告警结论以当前数据范围为限。",
@@ -455,20 +612,25 @@ function InsightRail({
           { label: "分析提醒", value: `${warningCount} 条`, tone: warningCount ? "amber" : "green" },
           { label: "活动告警", value: `${activeAlarms.length} 条`, tone: activeAlarms.length ? "amber" : "green" },
           { label: "高优先级", value: `${highAlarms} 条`, tone: highAlarms ? "amber" : "green" },
-        ], evidence: [...baseEvidence, { label: "告警来源", value: "设备告警与确定性规则" }], prompt: "解释当前异常风险，按优先级说明影响对象和证据" },
-      { id: "overview-saving", icon: "↓", tone: savings?.screening_savings_kwh ? "green" : "muted", title: "节能机会", badge: "节能筛查",
-        summary: savings?.screening_savings_kwh != null ? `筛查节能量 ${format(savings.screening_savings_kwh)} kWh` : "等待空压节能筛查结果",
-        detailTitle: savings?.screening_savings_kwh != null ? "空压系统存在可进一步核验的节能线索。" : "当前数据不足以量化节能机会。",
-        detailSummary: "节能量仅为确定性初筛，不换算金额，也不会直接下发控制指令。",
+        ], evidence: [...baseEvidence, { label: "告警来源", value: "设备告警与确定性规则" }], prompt: "解释首页运行异常洞察，按优先级说明影响对象和证据" },
+      { id: "overview-operation-advice", icon: "✓", tone: savings?.screening_savings_kwh ? "green" : "cyan", title: "运行建议", badge: "AI 建议",
+        summary: savings?.screening_savings_kwh != null ? `优先核验 ${format(savings.screening_savings_kwh)} kWh 节能筛查量` : "建议保持监测并补齐节能筛查数据",
+        detailTitle: "当前建议均为只读分析建议，需要人工确认后执行。",
+        detailSummary: "建议优先核验需量裕度、空压卸载能耗和异常告警；任何控制都必须创建 proposed 计划并通过审批。",
         metrics: [
           { label: "筛查节能量", value: savings?.screening_savings_kwh != null ? `${format(savings.screening_savings_kwh)} kWh` : "数据不足", tone: "green" },
-          { label: "卸载能耗", value: savings?.unloaded_energy_kwh != null ? `${format(savings.unloaded_energy_kwh)} kWh` : "数据不足" },
-          { label: "空载时长", value: compressorDevice?.idle_running_minutes != null ? `${format(compressorDevice.idle_running_minutes)} min` : "数据不足" },
-        ], evidence: [...baseEvidence, { label: "分析口径", value: "空压确定性节能初筛" }], prompt: "分析当前节能机会，说明筛查节能量、卸载能耗和适用边界" },
-      { id: "overview-carbon", icon: "CO₂", tone: "muted", title: "碳排洞察", badge: "核算准备度", summary: "碳排因子与产量基线尚未接入",
-        detailTitle: "当前不能生成正式碳排放或减排量。", detailSummary: "平台已有能耗数据，但仍缺少可审计排放因子、组织边界、产量和基准期。",
-        metrics: [{ label: "能耗数据", value: overview?.energy_consumption_kwh != null ? "已具备" : "待补充", tone: "green" }, { label: "排放因子", value: "未接入", tone: "amber" }, { label: "产量基线", value: "未接入", tone: "amber" }],
-        evidence: [...baseEvidence, { label: "核算状态", value: "仅完成能源数据准备" }], prompt: "说明当前碳核算的数据条件、缺口和下一步接入要求" },
+          { label: "峰均差", value: peakSpread != null ? `${format(peakSpread)} kW` : "数据不足" },
+          { label: "控制方式", value: "人工审批", tone: "cyan" },
+        ], evidence: [...baseEvidence, { label: "安全边界", value: "只读建议，不直接执行 RPC" }], prompt: "根据首页指标给出运行建议，说明哪些需要人工确认和审批" },
+      { id: "overview-confirmation", icon: "□", tone: warningCount || demandMargin != null && demandMargin < 0 ? "amber" : "muted", title: "待确认事项", badge: "人工确认",
+        summary: warningCount || demandMargin != null && demandMargin < 0 ? "存在需值班人员确认的风险与建议" : "当前暂无强制确认事项",
+        detailTitle: "待确认事项用于承接风险预警和运行建议。",
+        detailSummary: "当前包括需量风险核验、空压节能筛查复核、活动告警处置确认；确认后仍需走服务端审批和审计流程。",
+        metrics: [
+          { label: "需量风险确认", value: demandMargin != null && demandMargin < 0 ? "需要" : "暂无", tone: demandMargin != null && demandMargin < 0 ? "amber" : "green" },
+          { label: "异常确认", value: warningCount + activeAlarms.length ? `${warningCount + activeAlarms.length} 项` : "暂无" },
+          { label: "节能建议确认", value: savings?.screening_savings_kwh ? "需要复核" : "待数据", tone: savings?.screening_savings_kwh ? "cyan" : "muted" },
+        ], evidence: [...baseEvidence, { label: "闭环状态", value: "待接入责任人、执行记录和效果验证" }], prompt: "列出首页待确认事项，按风险、异常和运行建议分类说明" },
     ];
 
     const demandInsights: PageInsight[] = [
@@ -596,7 +758,7 @@ function MetricTile({ icon, label, value, unit, note, tone = "cyan" }: { icon: s
   return <article className={`metric-tile ${tone}`}><header><i>{icon}</i><span>{label}</span></header><strong>{value} <small>{unit}</small></strong><p>{note}</p></article>;
 }
 
-function Overview({ snapshots, powerAnalysis, compressorAnalysis }: { snapshots: DeviceSnapshot[]; powerAnalysis: PowerAnalysisResult | null; compressorAnalysis: CompressorAnalysisResult | null }) {
+function Overview({ snapshots, powerAnalysis, compressorAnalysis, loadForecast }: { snapshots: DeviceSnapshot[]; powerAnalysis: PowerAnalysisResult | null; compressorAnalysis: CompressorAnalysisResult | null; loadForecast: LoadForecastMockResponse }) {
   const meter = snapshots.find(row => row.device.type === "meter");
   const ems = snapshots.find(row => row.device.type === "ems");
   const compressor = snapshots.find(row => row.device.type === "compressor");
@@ -605,10 +767,13 @@ function Overview({ snapshots, powerAnalysis, compressorAnalysis }: { snapshots:
   const energy = valueOf(meter?.telemetry, "meter_SupWh");
   const demand = latestRecord(powerAnalysis?.metrics?.demand);
   const realtime = latestRecord(compressorAnalysis?.metrics?.realtime);
-  const history = seriesOf(meter?.history, "meter_TotW");
   return <div className="overview-workspace">
     <EnergyMap meter={meter} ems={ems} compressor={compressor} />
-    <section className="trend-panel"><div className="section-head"><div><p>负荷趋势</p><h3>最近24小时实际负荷</h3></div><span>{history.length} 个有效样本</span></div><Bars values={history} /><div className="chart-axis"><span>24小时前</span><span>12小时前</span><span>当前</span></div></section>
+    <section className="trend-panel forecast-panel"><div className="section-head"><div><p>AI 预测</p><h3>AI负荷预测（MW）</h3></div><span>mock服务占位 · 后续接入深度学习预测工具</span></div>
+      <div className="forecast-legend"><span><i className="solid cyan" />实际</span><span><i className="dash light" />AI预测</span><span><i className="dash muted" />基线</span><span><i className="solid amber" />限值</span></div>
+      <ForecastLineChart forecast={loadForecast} />
+      <div className="forecast-stats"><span>今日峰值预测 <b>{format(loadForecast.peak_prediction_mw, 2)} MW</b></span><span>风险时段 <b>{loadForecast.risk_window}</b></span><span>置信度 <b>{format(loadForecast.confidence * 100, 0)}%</b></span></div>
+    </section>
     <aside className="metric-rail">
       <MetricTile icon="∿" label="当前负荷" value={format(power)} unit="kW" note={demand?.max_demand_15m_kw != null ? `15分钟最大需量 ${format(demand.max_demand_15m_kw)} kW` : "需量计算中"} />
       <MetricTile icon="Σ" label="累计正向电量" value={format(energy)} unit="kWh" note="电表累计寄存器读数" tone="green" />
@@ -1028,7 +1193,7 @@ export default function App() {
       <InsightRail workspace={workspace} summary={latestSummary} snapshots={data.snapshots} powerAnalysis={data.powerAnalysis} compressorAnalysis={data.compressorAnalysis} summaryBusy={data.summaryBusy} onRefresh={data.refreshSummary} onAsk={ask} />
       <main className="main-stage">
         {data.loading && !data.snapshots.length && <div className="stage-loading"><i /><span>正在连接统一工业数据服务</span></div>}
-        {workspace === "overview" && <Overview snapshots={data.snapshots} powerAnalysis={data.powerAnalysis} compressorAnalysis={data.compressorAnalysis} />}
+        {workspace === "overview" && <Overview snapshots={data.snapshots} powerAnalysis={data.powerAnalysis} compressorAnalysis={data.compressorAnalysis} loadForecast={data.loadForecast} />}
         {workspace === "demand" && <DemandWorkspace analysis={data.powerAnalysis} history={history} onAsk={ask} />}
         {workspace === "quality" && <QualityWorkspace analysis={data.powerAnalysis} onAsk={ask} />}
         {workspace === "compressor" && <CompressorWorkspace analysis={data.compressorAnalysis} onAsk={ask} />}

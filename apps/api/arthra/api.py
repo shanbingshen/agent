@@ -73,6 +73,8 @@ from arthra.schemas import (
     KnowledgeDocumentRead,
     KnowledgeSearchResponse,
     KnowledgeUploadResponse,
+    LoadForecastMockResponse,
+    LoadForecastPoint,
     LoginRequest,
     NodeProgressView,
     RejectRequest,
@@ -1232,6 +1234,27 @@ def agent_traces(
 @router.get("/metrics", include_in_schema=False, tags=["observability"])
 def metrics(_: User = Depends(require_roles(Role.admin))) -> Response:
     return Response(METRICS.render_prometheus(), media_type="text/plain; version=0.0.4")
+
+
+@router.get("/load-forecast/mock", response_model=LoadForecastMockResponse, tags=["forecast"])
+def mock_load_forecast() -> LoadForecastMockResponse:
+    points = [
+        LoadForecastPoint(label="00:00", actual_mw=2.1, ai_prediction_mw=2.0, baseline_mw=2.3, limit_mw=8.6),
+        LoadForecastPoint(label="04:00", actual_mw=2.4, ai_prediction_mw=2.7, baseline_mw=2.5, limit_mw=8.6),
+        LoadForecastPoint(label="08:00", actual_mw=4.8, ai_prediction_mw=5.1, baseline_mw=4.2, limit_mw=8.6),
+        LoadForecastPoint(label="12:00", actual_mw=6.2, ai_prediction_mw=6.8, baseline_mw=5.5, limit_mw=8.6),
+        LoadForecastPoint(label="14:00", actual_mw=7.9, ai_prediction_mw=8.7, baseline_mw=7.2, limit_mw=8.6),
+        LoadForecastPoint(label="16:00", actual_mw=None, ai_prediction_mw=8.92, baseline_mw=7.8, limit_mw=8.6),
+        LoadForecastPoint(label="18:00", actual_mw=None, ai_prediction_mw=7.1, baseline_mw=6.2, limit_mw=8.6),
+        LoadForecastPoint(label="20:00", actual_mw=None, ai_prediction_mw=4.4, baseline_mw=3.8, limit_mw=8.6),
+        LoadForecastPoint(label="24:00", actual_mw=None, ai_prediction_mw=1.6, baseline_mw=1.9, limit_mw=8.6),
+    ]
+    return LoadForecastMockResponse(
+        confidence=0.92,
+        peak_prediction_mw=8.92,
+        risk_window="14:30-16:00",
+        points=points,
+    )
 
 
 @router.get("/health", include_in_schema=False)

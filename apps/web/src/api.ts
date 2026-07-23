@@ -108,6 +108,24 @@ export type PowerAnalysisResult = {
   };
 };
 
+export type LoadForecastPoint = {
+  label: string;
+  actual_mw: number | null;
+  ai_prediction_mw: number;
+  baseline_mw: number;
+  limit_mw: number;
+};
+
+export type LoadForecastMockResponse = {
+  unit: "MW";
+  source: "mock";
+  model_name: string;
+  confidence: number;
+  peak_prediction_mw: number;
+  risk_window: string;
+  points: LoadForecastPoint[];
+};
+
 export type CompressorAnalysisResult = {
   data_status: string;
   warnings?: Array<{ severity?: string; message?: string; device_name?: string }>;
