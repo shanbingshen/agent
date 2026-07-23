@@ -10,6 +10,24 @@ from pydantic import Field
 from arthra.contracts import StrictModel
 
 type QuestionRoute = Literal["power", "compressor", "ems", "conversation"]
+type QuestionMode = Literal[
+    "knowledge",
+    "realtime_query",
+    "analysis",
+    "optimization",
+    "control_request",
+    "conversation",
+    "out_of_domain",
+    "clarification",
+]
+type BusinessDomain = Literal[
+    "meter",
+    "compressor",
+    "ems",
+    "forecast",
+    "report",
+    "general",
+]
 type QuestionIntent = Literal[
     "GREETING",
     "CAPABILITY_QUERY",
@@ -19,6 +37,8 @@ type QuestionIntent = Literal[
     "KNOWLEDGE_POWER_ENERGY_DEMAND",
     "KNOWLEDGE_COMPRESSOR_UNLOAD",
     "KNOWLEDGE_CUMULATIVE_ENERGY",
+    "KNOWLEDGE_EXPLANATION",
+    "CONTROL_REQUEST",
     "REALTIME_POWER_QUERY",
     "ENERGY_PERIOD_QUERY",
     "ENERGY_PERIOD_COMPARE",
@@ -52,6 +72,9 @@ type QuestionIntent = Literal[
 class IntentDefinition(StrictModel):
     intent: QuestionIntent
     route: QuestionRoute
+    query_mode: QuestionMode = "analysis"
+    domain: BusinessDomain = "general"
+    subject: str = Field(default="", max_length=80)
     capabilities: list[str] = Field(default_factory=list, max_length=4)
     requires_device: bool = False
     uses_realtime: bool = False
@@ -81,6 +104,8 @@ INTENTS: dict[QuestionIntent, IntentDefinition] = {
     "KNOWLEDGE_POWER_ENERGY_DEMAND": IntentDefinition(intent="KNOWLEDGE_POWER_ENERGY_DEMAND", route="conversation"),
     "KNOWLEDGE_COMPRESSOR_UNLOAD": IntentDefinition(intent="KNOWLEDGE_COMPRESSOR_UNLOAD", route="conversation"),
     "KNOWLEDGE_CUMULATIVE_ENERGY": IntentDefinition(intent="KNOWLEDGE_CUMULATIVE_ENERGY", route="conversation"),
+    "KNOWLEDGE_EXPLANATION": IntentDefinition(intent="KNOWLEDGE_EXPLANATION", route="conversation"),
+    "CONTROL_REQUEST": IntentDefinition(intent="CONTROL_REQUEST", route="conversation"),
     "REALTIME_POWER_QUERY": IntentDefinition(
         intent="REALTIME_POWER_QUERY", route="power", capabilities=["realtime_power"],
         requires_device=True, uses_realtime=True, max_tool_calls=1,
@@ -198,6 +223,90 @@ INTENTS: dict[QuestionIntent, IntentDefinition] = {
 }
 
 
+_KNOWLEDGE_INTENTS: set[QuestionIntent] = {
+    "KNOWLEDGE_POWER_FACTOR",
+    "KNOWLEDGE_POWER_ENERGY_DEMAND",
+    "KNOWLEDGE_COMPRESSOR_UNLOAD",
+    "KNOWLEDGE_CUMULATIVE_ENERGY",
+    "KNOWLEDGE_EXPLANATION",
+}
+_METER_INTENTS: set[QuestionIntent] = {
+    "KNOWLEDGE_POWER_FACTOR",
+    "KNOWLEDGE_POWER_ENERGY_DEMAND",
+    "KNOWLEDGE_CUMULATIVE_ENERGY",
+    "REALTIME_POWER_QUERY",
+    "ENERGY_PERIOD_QUERY",
+    "ENERGY_PERIOD_COMPARE",
+    "PEAK_LOAD_QUERY",
+    "DEMAND_RISK_QUERY",
+    "DEMAND_15M_ANALYSIS",
+    "DEMAND_PEAK_AVERAGE_ANALYSIS",
+    "PEAK_AVERAGE_ANALYSIS",
+    "POWER_FACTOR_ANALYSIS",
+    "CURRENT_UNBALANCE_ANALYSIS",
+    "VOLTAGE_VIOLATION_ANALYSIS",
+    "POWER_QUALITY_ANALYSIS",
+    "GENERAL_POWER_ANALYSIS",
+}
+_COMPRESSOR_INTENTS: set[QuestionIntent] = {
+    "KNOWLEDGE_COMPRESSOR_UNLOAD",
+    "COMPRESSOR_STATUS_QUERY",
+    "COMPRESSOR_UNLOAD_ANALYSIS",
+    "COMPRESSOR_FREQUENT_START_STOP",
+    "COMPRESSOR_PRESSURE_FLUCTUATION",
+    "COMPRESSOR_HIGH_PRESSURE",
+    "COMPRESSOR_SPECIFIC_POWER",
+    "COMPRESSOR_ENERGY_CAUSE",
+    "COMPRESSOR_SAVINGS_ESTIMATE",
+    "COMPRESSOR_LEAKAGE_ANALYSIS",
+    "COMPRESSOR_AUXILIARY_POWER",
+    "GENERAL_COMPRESSOR_ANALYSIS",
+}
+_REALTIME_INTENTS: set[QuestionIntent] = {
+    "REALTIME_POWER_QUERY",
+    "COMPRESSOR_STATUS_QUERY",
+}
+
+
+def _mode_for_intent(intent: QuestionIntent) -> QuestionMode:
+    if intent in _KNOWLEDGE_INTENTS:
+        return "knowledge"
+    if intent in {"GREETING", "CAPABILITY_QUERY", "MODEL_IDENTITY"}:
+        return "conversation"
+    if intent == "OUT_OF_DOMAIN":
+        return "out_of_domain"
+    if intent == "CONTROL_REQUEST":
+        return "control_request"
+    if intent == "UNKNOWN":
+        return "clarification"
+    if intent in _REALTIME_INTENTS:
+        return "realtime_query"
+    if intent == "COMPRESSOR_SAVINGS_ESTIMATE":
+        return "optimization"
+    return "analysis"
+
+
+def _domain_for_intent(intent: QuestionIntent) -> BusinessDomain:
+    if intent in _METER_INTENTS:
+        return "meter"
+    if intent in _COMPRESSOR_INTENTS:
+        return "compressor"
+    if intent in {"GENERAL_ENERGY_ANALYSIS", "CROSS_ENERGY_CONTRIBUTION"}:
+        return "ems"
+    return "general"
+
+
+INTENTS = {
+    intent: definition.model_copy(
+        update={
+            "query_mode": _mode_for_intent(intent),
+            "domain": _domain_for_intent(intent),
+        }
+    )
+    for intent, definition in INTENTS.items()
+}
+
+
 _GREETING_WORDS = {"你好", "您好", "嗨", "hi", "hello", "在吗"}
 
 
@@ -207,6 +316,92 @@ def normalize_question(message: str) -> str:
 
 def _has(text: str, *keywords: str) -> bool:
     return any(keyword in text for keyword in keywords)
+
+
+_KNOWLEDGE_MARKERS = (
+    "什么是",
+    "是什么",
+    "什么意思",
+    "有什么作用",
+    "作用是什么",
+    "如何理解",
+    "请解释",
+    "解释一下",
+    "介绍一下",
+    "定义",
+    "含义",
+)
+_COMPRESSOR_KNOWLEDGE_TERMS = (
+    "空压机",
+    "压缩空气",
+    "比功率",
+    "加载率",
+    "卸载率",
+    "空载",
+    "卸载",
+    "供气压力",
+    "管网压力",
+    "储气罐",
+)
+_METER_KNOWLEDGE_TERMS = (
+    "电表",
+    "智能电表",
+    "功率因数",
+    "需量",
+    "有功功率",
+    "无功功率",
+    "累计电量",
+    "电能质量",
+    "三相不平衡",
+    "谐波",
+    "thdu",
+    "thdi",
+)
+_EMS_KNOWLEDGE_TERMS = (
+    "ems",
+    "能源管理",
+    "综合能源",
+    "储能",
+    "碳排",
+    "能耗",
+)
+
+
+def _knowledge_subject(text: str) -> str:
+    subject = text
+    for marker in ("请解释一下", "请解释", "解释一下", "介绍一下", "什么是"):
+        if subject.startswith(marker):
+            subject = subject[len(marker):]
+            break
+    for marker in ("是什么", "是什么意思", "什么意思", "有什么作用", "的作用", "的定义", "的含义"):
+        if subject.endswith(marker):
+            subject = subject[: -len(marker)]
+            break
+    return subject.strip(" ，,。！？?：:")[:80] or text[:80]
+
+
+def _knowledge_domain(text: str) -> BusinessDomain | None:
+    if _has(text, *_COMPRESSOR_KNOWLEDGE_TERMS):
+        return "compressor"
+    if _has(text, *_METER_KNOWLEDGE_TERMS):
+        return "meter"
+    if _has(text, *_EMS_KNOWLEDGE_TERMS):
+        return "ems"
+    return None
+
+
+def _generic_knowledge_definition(text: str) -> IntentDefinition | None:
+    if not _has(text, *_KNOWLEDGE_MARKERS):
+        return None
+    domain = _knowledge_domain(text)
+    if domain is None:
+        return None
+    return INTENTS["KNOWLEDGE_EXPLANATION"].model_copy(
+        update={
+            "domain": domain,
+            "subject": _knowledge_subject(text),
+        }
+    )
 
 
 def classify_question(message: str) -> IntentDefinition | None:
@@ -225,8 +420,33 @@ def classify_question(message: str) -> IntentDefinition | None:
         return INTENTS["KNOWLEDGE_COMPRESSOR_UNLOAD"]
     if "累计电量" in text and _has(text, "正常吗", "异常吗", "什么意思"):
         return INTENTS["KNOWLEDGE_CUMULATIVE_ENERGY"]
+    generic_knowledge = _generic_knowledge_definition(text)
+    if generic_knowledge is not None:
+        return generic_knowledge
     if _has(text, "电影", "写诗", "天气", "股票", "旅游"):
         return INTENTS["OUT_OF_DOMAIN"]
+    if _has(
+        text,
+        "帮我启动",
+        "帮我停止",
+        "立即启动",
+        "立即停止",
+        "直接启动",
+        "直接停止",
+        "设置为",
+        "设为",
+        "调到",
+        "下发控制",
+        "执行控制",
+    ):
+        control_domain = _knowledge_domain(text)
+        if control_domain is not None:
+            return INTENTS["CONTROL_REQUEST"].model_copy(
+                update={
+                    "domain": control_domain,
+                    "subject": text[:80],
+                }
+            )
     if _has(text, "全厂用电", "工厂用电") and "空压" in text and _has(text, "造成", "贡献", "是不是"):
         return INTENTS["CROSS_ENERGY_CONTRIBUTION"]
     if "空压" in text and _has(text, "停机", "停止") and _has(text, "电表", "功率"):

@@ -165,3 +165,38 @@ def test_all_registered_intents_obey_tool_call_limit():
     for definition in INTENTS.values():
         assert definition.max_tool_calls == len(definition.capabilities)
         assert definition.max_tool_calls <= 4
+
+
+@pytest.mark.parametrize(
+    ("question", "domain", "subject"),
+    [
+        ("什么是电表？", "meter", "电表"),
+        ("什么是空压机？", "compressor", "空压机"),
+        ("什么是比功率？", "compressor", "比功率"),
+    ],
+)
+def test_definition_questions_use_generic_knowledge_mode_without_tools(
+    question,
+    domain,
+    subject,
+):
+    definition = classify_question(question)
+
+    assert definition is not None
+    assert definition.query_mode == "knowledge"
+    assert definition.domain == domain
+    assert definition.intent == "KNOWLEDGE_EXPLANATION"
+    assert definition.subject == subject
+    assert definition.route == "conversation"
+    assert definition.requires_device is False
+    assert definition.capabilities == []
+
+
+def test_specific_power_value_question_remains_deterministic_analysis():
+    definition = classify_question("这台空压机最近24小时的比功率是多少？")
+
+    assert definition is not None
+    assert definition.query_mode == "analysis"
+    assert definition.domain == "compressor"
+    assert definition.intent == "COMPRESSOR_SPECIFIC_POWER"
+    assert definition.capabilities == ["specific_power"]

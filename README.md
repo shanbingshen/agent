@@ -34,7 +34,7 @@ flowchart TB
 
 | 能力 | MVP 实现 |
 | --- | --- |
-| 能力识别 | 受控问答意图优先精确匹配，未登记问题再使用 Qwen/OpenAI-compatible 语义分类；全部路由结果经过 Pydantic 校验 |
+| 能力识别 | “问题模式 → 业务领域 → 专业意图”三级路由；高置信受控问法优先匹配，未登记问题使用 Qwen/OpenAI-compatible 语义分类，全部结果经过 Pydantic 校验 |
 | 模型 | OpenAI-compatible 接口，可配置 OpenAI、Qwen、DeepSeek、Ollama 或 vLLM |
 | 状态 | LangGraph PostgreSQL Checkpoint，线程由 `thread_id` 隔离 |
 | 知识库 | 文本切分、pgvector、相似度检索与引用接口 |
@@ -133,7 +133,9 @@ EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 EMBEDDING_MODEL=text-embedding-v4
 ```
 
-Supervisor 先使用 `question_answering.py` 中的受控意图表识别已登记问法，再把未登记问题交给语义模型。模型只能返回 `ems / power / compressor / forecast / report / conversation` 之一，并使用 Pydantic 校验路由、置信度、理由和能力标签。问候、感谢、能力询问和非工业能源问题进入 `conversation`，不会读取设备、执行专家工具或生成能源报告；未识别到工业能源意图时也默认进入该安全边界。模型返回非法 JSON、非法专家、置信度低于阈值或调用失败时，自动退回中文/英文关键词路由。未配置 `LLM_API_KEY` 时，平台、设备、路由和知识库仍能运行。未配置嵌入 API 时使用确定性的本地演示向量；生产环境应配置正式嵌入模型并保持 384 维，或同时修改迁移中的向量维度。
+Supervisor 先使用 `question_answering.py` 中的受控意图表识别高置信问法，再把未登记或含糊问题交给语义模型。路由输出分为三级：`query_mode` 区分知识解释、实时查询、分析、优化、控制请求、会话、越界和澄清；`domain` 区分电表、空压机、EMS、预测、报告和通用领域；`intent` 再选择具体专业能力。输出还包含主题、是否需要工业数据、是否需要澄清、置信度和能力标签，并全部通过严格 Pydantic 模型校验。
+
+知识解释统一进入 `KNOWLEDGE_EXPLANATION`，例如“什么是比功率”不会读取 ThingsBoard 或执行专家工具，而由模型在工业知识边界内简短解释；“这台空压机比功率是多少”则进入 `COMPRESSOR_SPECIFIC_POWER` 并调用确定性工具。问候、感谢、能力询问和非工业能源问题进入 `conversation`，不会读取设备、执行专家工具或生成能源报告；控制请求只识别诉求并提示创建待审批计划。模型返回非法 JSON、非法分类、置信度低于阈值或调用失败时，自动退回受控意图或中英文关键词路由。未配置 `LLM_API_KEY` 时，平台、设备、路由和知识解释的内置安全回退仍可运行。
 
 空压机专家和电力与需量专家采用“确定性工具计算 + 千问解释”的两层输出：所有指标、阈值、告警和数据质量先由 Python 工具生成严格 Pydantic 结果，千问只读取面向客户的确定性报告并补充简短专业解读，不负责重新计算。客户模式不展示基础模型名称；管理员调试模式才显示模型版本。模型未配置、被禁用、返回空内容或调用失败时，会自动退回确定性报告，不影响分析工具使用。
 
@@ -320,7 +322,7 @@ POST /api/v1/power-analysis
 
 ## Pydantic 数据契约
 
-项目采用“外部数据源投影 → 统一工业数据模型 → 领域上下文 → 确定性结果 → API DTO”的分层契约。`StrictModel` 默认设置 `extra="forbid"` 和赋值校验；Qwen Supervisor 输出通过 `SemanticRouteOutput` 校验，数据源适配器把设备、时序、属性和告警收敛为统一模型，空压和电力分析输出使用明确的指标、告警、建议和上下文模型。控制命令使用方法与参数配对模型，例如 `setPowerLimit` 只能接收 `{ "value": number }`，`start/stop` 只能接收空参数。
+项目采用“外部数据源投影 → 统一工业数据模型 → 领域上下文 → 确定性结果 → API DTO”的分层契约。`StrictModel` 默认设置 `extra="forbid"` 和赋值校验；Qwen Supervisor 的问题模式、业务领域、专业意图、主题和数据需求通过 `SemanticRouteOutput` 校验，数据源适配器把设备、时序、属性和告警收敛为统一模型，空压和电力分析输出使用明确的指标、告警、建议和上下文模型。控制命令使用方法与参数配对模型，例如 `setPowerLimit` 只能接收 `{ "value": number }`，`start/stop` 只能接收空参数。
 
 SQLAlchemy 继续负责数据库映射，不与 Pydantic 混用；JSON 列写入前使用严格模型序列化，读取 API 时使用 `from_attributes=True` 的 DTO。数学运算中的局部字典、LangGraph 节点更新映射和 HTTP 客户端参数不是业务数据契约，可以保留普通容器。
 
