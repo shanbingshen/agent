@@ -78,6 +78,8 @@ class ControlService:
     ) -> None:
         self.db.add(
             AuditEvent(
+                tenant_id=plan.tenant_id,
+                factory_id=plan.factory_id,
                 actor_id=actor_id,
                 action=action,
                 resource_type="control_plan",
@@ -92,6 +94,7 @@ class ControlService:
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
         plan = ControlPlan(
+            tenant_id=actor.tenant_id,
             **payload.model_dump(exclude={"params"}),
             params=params.model_dump(mode="json"),
             created_by=actor.id,

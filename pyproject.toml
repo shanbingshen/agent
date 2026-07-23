@@ -34,7 +34,24 @@ dev = [
 package = false
 
 [tool.pytest.ini_options]
-pythonpath = ["apps/api", "services/simulator"]
+pythonpath = [
+  "apps/api",
+  "apps/arthra-gateway/src",
+  "apps/arthra-orchestrator/src",
+  "apps/arthra-scheduler/src",
+  "agents/main-agent/src",
+  "agents/power-agent/src",
+  "agents/compressor-agent/src",
+  "packages/core/src",
+  "packages/rag/src",
+  "packages/memory/src",
+  "packages/tools/src",
+  "packages/mcp-client/src",
+  "packages/evaluation/src",
+  "packages/observability/src",
+  "mcp-servers/energy-data/src",
+  "services/simulator",
+]
 testpaths = ["tests"]
 addopts = "-q"
 

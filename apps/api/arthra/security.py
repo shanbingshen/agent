@@ -13,7 +13,8 @@ from sqlalchemy.orm import Session
 
 from arthra.config import get_settings
 from arthra.db import get_db
-from arthra.models import Role, User
+from arthra.models import DEFAULT_FACTORY_ID, DEFAULT_TENANT_ID, Role, User, UserFactoryAccess
+from arthra.tenancy import bootstrap_default_scope
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 
@@ -40,6 +41,7 @@ def create_access_token(user: User) -> str:
     now = datetime.now(UTC)
     payload = {
         "sub": str(user.id),
+        "tid": str(user.tenant_id),
         "role": user.role.value,
         "iat": now,
         "exp": now + timedelta(minutes=settings.access_token_expire_minutes),
@@ -53,10 +55,11 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     try:
         payload = jwt.decode(token, settings.app_secret_key, algorithms=["HS256"])
         user_id = uuid.UUID(payload["sub"])
+        tenant_id = uuid.UUID(payload["tid"])
     except (jwt.PyJWTError, KeyError, ValueError) as exc:
         raise credentials_error from exc
     user = db.get(User, user_id)
-    if user is None or not user.is_active:
+    if user is None or not user.is_active or user.tenant_id != tenant_id:
         raise credentials_error
     return user
 
@@ -72,14 +75,24 @@ def require_roles(*roles: Role):
 
 def bootstrap_admin(db: Session) -> None:
     settings = get_settings()
+    bootstrap_default_scope(db)
     existing = db.scalar(select(User).where(User.email == settings.bootstrap_admin_email))
     if existing is None:
+        existing = User(
+            tenant_id=DEFAULT_TENANT_ID,
+            email=settings.bootstrap_admin_email,
+            password_hash=hash_password(settings.bootstrap_admin_password),
+            role=Role.admin,
+        )
+        db.add(existing)
+        db.flush()
+    grant = db.get(UserFactoryAccess, (existing.id, DEFAULT_FACTORY_ID))
+    if grant is None:
         db.add(
-            User(
-                email=settings.bootstrap_admin_email,
-                password_hash=hash_password(settings.bootstrap_admin_password),
-                role=Role.admin,
+            UserFactoryAccess(
+                user_id=existing.id,
+                factory_id=DEFAULT_FACTORY_ID,
+                can_manage_devices=True,
             )
         )
-        db.commit()
-
+    db.commit()

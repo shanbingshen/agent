@@ -3,6 +3,7 @@ from arthra.agent import (
     RouteDecision,
     build_graph,
     classify_route,
+    resolve_short_term_context,
     route_message,
     synthesize,
 )
@@ -16,6 +17,7 @@ from arthra.compressor.schemas import (
 )
 from arthra.config import Settings
 from arthra.contracts import AnalysisWarning
+from arthra.conversation_schemas import ConversationContext, ConversationTurn
 from arthra.power.schemas import (
     DemandMetrics,
     PowerAnalysisResult,
@@ -24,6 +26,7 @@ from arthra.power.schemas import (
     PowerDataQuality,
     PowerMetrics,
 )
+from arthra.question_answering import QueryTimeRange
 from langchain_core.messages import ToolMessage
 
 
@@ -116,7 +119,9 @@ def test_model_identity_uses_product_identity_without_exposing_base_model(monkey
 def test_semantic_route_uses_validated_qwen_decision(monkeypatch):
     class FakeResponse:
         content = """```json
-        {"route":"compressor","confidence":0.94,"reason":"涉及卸载和供气","capabilities":["idle_running"]}
+        {"query_mode":"analysis","domain":"compressor","intent":"COMPRESSOR_UNLOAD_ANALYSIS",
+        "subject":"卸载和供气","requires_industrial_data":true,"needs_clarification":false,
+        "confidence":0.94,"reason":"涉及卸载和供气","capabilities":["idle_running"]}
         ```"""
 
     class FakeModel:
@@ -136,6 +141,9 @@ def test_semantic_route_uses_validated_qwen_decision(monkeypatch):
     decision = classify_route("1号机最近一直卸载，帮我看看供气情况", ["device-1"])
 
     assert decision.route == "compressor"
+    assert decision.query_mode == "analysis"
+    assert decision.domain == "compressor"
+    assert decision.intent == "COMPRESSOR_UNLOAD_ANALYSIS"
     assert decision.source == "qwen"
     assert decision.capabilities == ["idle_running"]
 
@@ -168,7 +176,12 @@ def test_registered_question_skips_semantic_model_even_when_it_would_return_inva
 
 def test_semantic_route_applies_deterministic_domain_guard(monkeypatch):
     class FakeResponse:
-        content = '{"route":"ems","confidence":0.96,"reason":"general energy request","capabilities":[]}'
+        content = (
+            '{"query_mode":"analysis","domain":"ems","intent":"GENERAL_ENERGY_ANALYSIS",'
+            '"subject":"compressor load rate","requires_industrial_data":true,'
+            '"needs_clarification":false,"confidence":0.96,'
+            '"reason":"general energy request","capabilities":[]}'
+        )
 
     class FakeModel:
         def __init__(self, **kwargs):
@@ -186,8 +199,49 @@ def test_semantic_route_applies_deterministic_domain_guard(monkeypatch):
     decision = classify_route("analyze compressor load rate", ["compressor-1"])
 
     assert decision.route == "compressor"
+    assert decision.domain == "compressor"
     assert decision.source == "hybrid_guard"
     assert decision.confidence == 0.96
+
+
+def test_generic_knowledge_question_uses_qwen_explanation_without_reading_devices(
+    monkeypatch,
+):
+    class FakeResponse:
+        content = (
+            '{"answer":"比功率表示空压机生产单位压缩空气所需的输入功率，常用单位为 '
+            'kW/(m³/min)。比较时应统一供气压力和流量基准。"}'
+        )
+
+    class FakeModel:
+        def __init__(self, **kwargs):
+            assert kwargs["temperature"] == 0
+
+        def invoke(self, prompt):
+            assert "不查询或声称读取了当前设备" in str(prompt)
+            return FakeResponse()
+
+    def unexpected_loader(device_ids):
+        raise AssertionError("知识解释不应读取工业数据")
+
+    monkeypatch.setattr(
+        "arthra.agent.get_settings",
+        lambda: Settings(llm_api_key="test-key"),
+    )
+    monkeypatch.setattr("arthra.agent.ChatOpenAI", FakeModel)
+    graph = build_graph(telemetry_loader=unexpected_loader)
+
+    result = graph.invoke(
+        {"message": "什么是比功率？", "device_scope": ["compressor-1"]},
+        {"configurable": {"thread_id": "knowledge-specific-power-test"}},
+    )
+
+    assert result["route"] == "conversation"
+    assert result["route_decision"]["query_mode"] == "knowledge"
+    assert result["route_decision"]["domain"] == "compressor"
+    assert result["route_decision"]["intent"] == "KNOWLEDGE_EXPLANATION"
+    assert result["analysis"] is None
+    assert "kW/(m³/min)" in result["response"]
 
 
 def test_graph_accepts_injected_semantic_classifier(monkeypatch):
@@ -348,7 +402,141 @@ def test_same_thread_can_run_twice_with_pydantic_state(monkeypatch):
 
     assert first["route"] == "power"
     assert second["route"] == "power"
+    assert isinstance(first["route_decision"], RouteDecision)
+    assert isinstance(second["route_decision"], RouteDecision)
     assert second["analysis"].method == "deterministic-first"
+
+
+def test_short_term_context_resolves_follow_up_scope_capability_and_time():
+    time_range = QueryTimeRange(
+        start_at="2026-07-20T16:00:00Z",
+        end_at="2026-07-21T16:00:00Z",
+        label="昨日00:00—24:00",
+    )
+    state = AgentState(
+        message="继续分析它",
+        page_workspace="compressor",
+        conversation_context=ConversationContext(
+            active_route="compressor",
+            active_intent="COMPRESSOR_UNLOAD_ANALYSIS",
+            active_device_scope=["compressor-1"],
+            active_capabilities=["load_rate"],
+            active_time_range=time_range,
+            active_workspace="compressor",
+            turns=[
+                ConversationTurn(
+                    user_message="分析昨天1号空压机的加载率",
+                    assistant_summary="已完成加载率分析。",
+                    route="compressor",
+                    intent="COMPRESSOR_UNLOAD_ANALYSIS",
+                    device_scope=["compressor-1"],
+                    capabilities=["load_rate"],
+                    time_range=time_range,
+                )
+            ],
+        ),
+    )
+
+    resolved = resolve_short_term_context(state)
+
+    assert resolved["context_applied"] is True
+    assert resolved["context_route_hint"] == "compressor"
+    assert resolved["context_intent_hint"] == "COMPRESSOR_UNLOAD_ANALYSIS"
+    assert resolved["context_capabilities"] == ["load_rate"]
+    assert resolved["context_time_range"] == time_range
+    assert resolved["device_scope"] == ["compressor-1"]
+
+
+def test_visible_page_time_scope_applies_when_question_has_no_time():
+    resolved = resolve_short_term_context(
+        AgentState(
+            message="分析这台空压机的加载率",
+            device_scope=["compressor-1"],
+            page_workspace="compressor",
+            page_time_scope="yesterday",
+        )
+    )
+
+    assert resolved["context_time_range"] is not None
+    assert resolved["context_time_range"].label == "昨日00:00—24:00"
+    assert resolved["context_time_range"].defaulted is False
+
+
+def test_same_thread_follow_up_uses_previous_expert_and_device_scope(monkeypatch):
+    monkeypatch.setattr("arthra.agent.get_settings", lambda: Settings(llm_api_key=""))
+    loaded_scopes: list[list[str]] = []
+
+    def loader(ids):
+        loaded_scopes.append(list(ids))
+        return [
+            {
+                "id": "compressor-1",
+                "name": "Arthra-Compressor-01",
+                "type": "compressor",
+                "telemetry": {
+                    "power_kw": 80.0,
+                    "pressure_bar": 7.0,
+                    "temperature_c": 65.0,
+                    "running": True,
+                },
+                "timestamps": {},
+            }
+        ]
+
+    graph = build_graph(telemetry_loader=loader)
+    config = {"configurable": {"thread_id": "context-follow-up-test"}}
+    first = graph.invoke(
+        {
+            "message": "分析空压机运行状态",
+            "device_scope": ["compressor-1"],
+            "page_workspace": "compressor",
+        },
+        config,
+    )
+    second = graph.invoke(
+        {
+            "message": "继续分析它",
+            "device_scope": [],
+            "page_workspace": "compressor",
+        },
+        config,
+    )
+
+    assert first["route"] == "compressor"
+    assert second["route"] == "compressor"
+    assert second["route_decision"]["source"] == "context"
+    assert second["device_scope"] == ["compressor-1"]
+    assert second["context_applied"] is True
+    assert len(second["conversation_context"].turns) == 2
+    assert loaded_scopes[-1] == ["compressor-1"]
+
+
+def test_explicit_new_domain_overrides_previous_conversation_context(monkeypatch):
+    monkeypatch.setattr("arthra.agent.get_settings", lambda: Settings(llm_api_key=""))
+    graph = build_graph(
+        telemetry_loader=lambda ids: [
+            {
+                "id": ids[0],
+                "name": "Selected Device",
+                "type": "meter" if ids[0] == "meter-1" else "compressor",
+                "telemetry": {"meter_TotW": 100.0, "running": True},
+                "timestamps": {},
+            }
+        ]
+    )
+    config = {"configurable": {"thread_id": "context-domain-switch-test"}}
+    graph.invoke(
+        {"message": "分析空压机", "device_scope": ["compressor-1"]},
+        config,
+    )
+    result = graph.invoke(
+        {"message": "分析电表功率", "device_scope": ["meter-1"]},
+        config,
+    )
+
+    assert result["route"] == "power"
+    assert result["route_decision"]["source"] == "keyword"
+    assert result["device_scope"] == ["meter-1"]
 
 
 def test_production_compressor_branch_executes_selected_tools_through_tool_node(monkeypatch):
@@ -549,10 +737,45 @@ def test_specialist_model_failure_keeps_deterministic_response(monkeypatch):
         ),
     )
 
-    response = synthesize(state)["response"]
+    result = synthesize(state)
+    response = result["response"]
 
     assert "功率因数 0.955" in response
     assert "千问专家解读" not in response
+    assert result["expert_supplement_status"] == "unavailable"
+
+
+def test_empty_quoted_specialist_supplement_is_hidden(monkeypatch):
+    class EmptyResponse:
+        content = '""'
+
+    class EmptyModel:
+        def __init__(self, **kwargs):
+            pass
+
+        def invoke(self, messages):
+            return EmptyResponse()
+
+    monkeypatch.setattr(
+        "arthra.agent.get_settings",
+        lambda: Settings(llm_api_key="test-key", llm_model="qwen-test"),
+    )
+    monkeypatch.setattr("arthra.agent.ChatOpenAI", EmptyModel)
+    result = synthesize(
+        AgentState(
+            message="分析功率因数",
+            device_scope=["meter-1"],
+            analysis=PowerAnalysisResult(
+                data_status="available",
+                capabilities=["power_factor"],
+                findings=["功率因数 0.955。"],
+                confidence=1,
+            ),
+        )
+    )
+
+    assert "专家补充" not in result["response"]
+    assert result["expert_supplement_status"] == "empty"
 
 
 def test_customer_power_report_uses_rolling_demand_and_hides_internal_details(monkeypatch):

@@ -1,0 +1,11 @@
+knowledge_sources:
+  - shared
+  - compressor
+
+allowed_rag_domains:
+  - shared
+  - compressor
+
+deterministic_services:
+  - CompressorContextBuilder
+  - CompressorAnalysisService

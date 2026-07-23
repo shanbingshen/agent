@@ -1,0 +1,9 @@
+knowledge_sources:
+  - shared
+
+allowed_rag_domains:
+  - shared
+
+notes:
+  - Main Agent may route to expert agents and use shared knowledge only.
+  - Domain-specific retrieval must be delegated to the selected expert agent.

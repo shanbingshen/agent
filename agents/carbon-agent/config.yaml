@@ -1,0 +1,7 @@
+knowledge_sources:
+  - shared
+  - carbon
+
+allowed_rag_domains:
+  - shared
+  - carbon

@@ -222,7 +222,7 @@ def _demand_metrics(
                     device_id=meter.device_id,
                     device_name=meter.device_name,
                     message=(
-                        f"15分钟最大需量 {maximum.value:.2f} kW 超过申报需量 "
+                        f"15分钟最大需量 {maximum.value:.2f} kW 超过需量控制目标 "
                         f"{meter.declared_demand_kw:.2f} kW"
                     ),
                     evidence={
@@ -522,7 +522,7 @@ class PowerAnalysisService:
                 unique_warnings.append(warning)
         recommendations: list[Recommendation] = []
         if any(warning.code == "DECLARED_DEMAND_EXCEEDED" for warning in unique_warnings):
-            recommendations.append(Recommendation(code="REVIEW_DECLARED_DEMAND", message="核查申报需量与负荷计划，并评估错峰或需量申报调整。"))
+            recommendations.append(Recommendation(code="REVIEW_DECLARED_DEMAND", message="核查需量控制目标与负荷计划，并评估错峰或合同需量调整。"))
         if any(warning.code and ("THD" in warning.code or "UNBALANCE" in warning.code) for warning in unique_warnings):
             recommendations.append(Recommendation(code="TRACE_POWER_QUALITY_SOURCE", message="按异常时间窗定位谐波或不平衡负荷源，治理前先复核计量接线和采样质量。"))
 

@@ -1,0 +1,7 @@
+knowledge_sources:
+  - shared
+  - ems
+
+allowed_rag_domains:
+  - shared
+  - ems

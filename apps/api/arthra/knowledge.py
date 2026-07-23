@@ -1,6 +1,7 @@
 import hashlib
 import math
 import re
+import uuid
 from collections.abc import Iterable
 
 import httpx
@@ -8,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from arthra.config import get_settings
-from arthra.models import KnowledgeChunk
+from arthra.models import KnowledgeChunk, KnowledgeDocument
 from arthra.schemas import KnowledgeSearchResult
 
 
@@ -53,21 +54,35 @@ def embed_texts(texts: Iterable[str]) -> list[list[float]]:
     return [item["embedding"] for item in response.json()["data"]]
 
 
-def search_knowledge(db: Session, query: str, limit: int = 5) -> list[KnowledgeSearchResult]:
+def search_knowledge(
+    db: Session,
+    query: str,
+    limit: int = 5,
+    *,
+    tenant_id: uuid.UUID | None = None,
+    factory_id: uuid.UUID | None = None,
+) -> list[KnowledgeSearchResult]:
     vector = embed_texts([query])[0]
     distance = KnowledgeChunk.embedding.cosine_distance(vector)
-    rows = db.execute(
-        select(KnowledgeChunk, distance.label("distance"))
+    statement = (
+        select(KnowledgeChunk, distance.label("distance"), KnowledgeDocument)
+        .join(KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id)
         .where(KnowledgeChunk.embedding.is_not(None))
         .order_by(distance)
         .limit(limit)
-    ).all()
+    )
+    if tenant_id is not None:
+        statement = statement.where(KnowledgeDocument.tenant_id == tenant_id)
+    if factory_id is not None:
+        statement = statement.where(KnowledgeDocument.factory_id == factory_id)
+    rows = db.execute(statement).all()
     return [
         KnowledgeSearchResult(
             chunk_id=chunk.id,
             document_id=chunk.document_id,
+            document_name=document.filename,
             content=chunk.content,
             score=round(1 - float(item_distance), 4),
         )
-        for chunk, item_distance in rows
+        for chunk, item_distance, document in rows
     ]

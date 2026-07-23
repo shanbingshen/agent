@@ -38,7 +38,20 @@ from arthra.question_answering import (
         ("3号电表三相电流不平衡吗？", "CURRENT_UNBALANCE_ANALYSIS", "power", ["phase_imbalance"]),
         ("昨天电压有没有越限？", "VOLTAGE_VIOLATION_ANALYSIS", "power", ["voltage_deviation"]),
         ("1号空压机现在运行正常吗？", "COMPRESSOR_STATUS_QUERY", "compressor", ["realtime_status"]),
-        ("1号空压机昨天卸载严重吗？", "COMPRESSOR_UNLOAD_ANALYSIS", "compressor", ["load_rate"]),
+        ("空压机运行状况怎么样？", "COMPRESSOR_STATUS_QUERY", "compressor", ["realtime_status"]),
+        (
+            "对空压机进行一个综合分析",
+            "GENERAL_COMPRESSOR_ANALYSIS",
+            "compressor",
+            ["realtime_status", "energy_consumption", "load_rate", "pressure_fluctuation"],
+        ),
+        (
+            "空压机有没有耗电？",
+            "COMPRESSOR_ENERGY_CAUSE",
+            "compressor",
+            ["energy_consumption", "load_rate", "high_pressure"],
+        ),
+        ("1号空压机昨天卸载严重吗？", "COMPRESSOR_UNLOAD_ANALYSIS", "compressor", ["load_rate", "idle_running"]),
         (
             "2号空压机最近是否频繁启停？",
             "COMPRESSOR_FREQUENT_START_STOP",
@@ -94,7 +107,7 @@ def test_peak_question_plans_only_peak_detection_tool():
     assert planned["query_time_range"].label == "昨日00:00—24:00"
 
 
-def test_compressor_unload_question_plans_only_load_rate_tool():
+def test_compressor_unload_question_plans_rate_and_continuous_idle_tools():
     state = AgentState(
         message="1号空压机昨天卸载严重吗？",
         device_scope=["compressor-1"],
@@ -112,7 +125,7 @@ def test_compressor_unload_question_plans_only_load_rate_tool():
     planned = plan_compressor_tools(state)
 
     assert planned["compressor_execution"] == "tools"
-    assert planned["selected_capabilities"] == ["load_rate"]
+    assert planned["selected_capabilities"] == ["load_rate", "idle_running"]
     assert planned["query_time_range"].label == "昨日00:00—24:00"
 
 
@@ -152,3 +165,38 @@ def test_all_registered_intents_obey_tool_call_limit():
     for definition in INTENTS.values():
         assert definition.max_tool_calls == len(definition.capabilities)
         assert definition.max_tool_calls <= 4
+
+
+@pytest.mark.parametrize(
+    ("question", "domain", "subject"),
+    [
+        ("什么是电表？", "meter", "电表"),
+        ("什么是空压机？", "compressor", "空压机"),
+        ("什么是比功率？", "compressor", "比功率"),
+    ],
+)
+def test_definition_questions_use_generic_knowledge_mode_without_tools(
+    question,
+    domain,
+    subject,
+):
+    definition = classify_question(question)
+
+    assert definition is not None
+    assert definition.query_mode == "knowledge"
+    assert definition.domain == domain
+    assert definition.intent == "KNOWLEDGE_EXPLANATION"
+    assert definition.subject == subject
+    assert definition.route == "conversation"
+    assert definition.requires_device is False
+    assert definition.capabilities == []
+
+
+def test_specific_power_value_question_remains_deterministic_analysis():
+    definition = classify_question("这台空压机最近24小时的比功率是多少？")
+
+    assert definition is not None
+    assert definition.query_mode == "analysis"
+    assert definition.domain == "compressor"
+    assert definition.intent == "COMPRESSOR_SPECIFIC_POWER"
+    assert definition.capabilities == ["specific_power"]

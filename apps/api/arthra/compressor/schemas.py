@@ -169,6 +169,12 @@ class CompressorContextSummary(StrictModel):
     data_quality: DataQuality
 
 
+class IdleRunningPeriod(StrictModel):
+    start_ts: int = Field(ge=0)
+    end_ts: int = Field(ge=0)
+    duration_minutes: float = Field(ge=0)
+
+
 class CompressorDeviceMetrics(StrictModel):
     device_name: str
     load_rate_pct: float | None = Field(default=None, ge=0, le=100)
@@ -181,6 +187,8 @@ class CompressorDeviceMetrics(StrictModel):
     sample_coverage: float | None = Field(default=None, ge=0, le=1)
     idle_running_minutes: float | None = Field(default=None, ge=0)
     longest_idle_running_minutes: float | None = Field(default=None, ge=0)
+    idle_event_count: int | None = Field(default=None, ge=0)
+    idle_periods: list[IdleRunningPeriod] = Field(default_factory=list, max_length=100)
     start_count: int | None = Field(default=None, ge=0)
     start_observation_hours: float | None = Field(default=None, ge=0)
     starts_per_hour: float | None = Field(default=None, ge=0)

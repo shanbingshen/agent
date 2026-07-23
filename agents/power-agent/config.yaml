@@ -1,0 +1,11 @@
+knowledge_sources:
+  - shared
+  - power
+
+allowed_rag_domains:
+  - shared
+  - power
+
+deterministic_services:
+  - PowerContextBuilder
+  - PowerAnalysisService
