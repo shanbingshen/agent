@@ -1,20 +1,19 @@
 """Agent-facing retrieval service."""
 
 from arthra.contracts import Citation
+from arthra.knowledge import search_knowledge
 from sqlalchemy.orm import Session
 
 from arthra_rag.schemas import RetrievalRequest
-from arthra_rag.vectorstore import search_pgvector
 
 
 def retrieve(db: Session, request: RetrievalRequest) -> list[Citation]:
     """Retrieve citations within the tenant/factory boundary.
 
-    Domain filters are part of the stable contract. The current storage schema
-    does not yet persist source domains, so this adapter preserves existing
-    behavior while keeping the future vector-store filter surface explicit.
+    Domain filters are part of the stable contract. The current Milvus schema
+    enforces tenant/factory scope and keeps future domain filtering explicit.
     """
-    results = search_pgvector(
+    results = search_knowledge(
         db,
         request.query,
         limit=request.limit,

@@ -1,6 +1,4 @@
-from arthra_rag.retriever import retrieve
 from arthra_rag.schemas import KnowledgeFilters, RetrievalRequest, RetrievalResponse
-from arthra_rag.service import ingest_text, retrieve_citations
 
 __all__ = [
     "KnowledgeFilters",
@@ -10,3 +8,15 @@ __all__ = [
     "retrieve",
     "retrieve_citations",
 ]
+
+
+def __getattr__(name: str):
+    if name == "retrieve":
+        from arthra_rag.retriever import retrieve
+
+        return retrieve
+    if name in {"ingest_text", "retrieve_citations"}:
+        from arthra_rag import service
+
+        return getattr(service, name)
+    raise AttributeError(name)

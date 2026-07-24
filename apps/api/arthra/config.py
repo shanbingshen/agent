@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     rag_retrieval_enabled: bool = True
     rag_top_k: int = Field(default=4, ge=1, le=10)
     rag_min_score: float = Field(default=0.2, ge=-1, le=1)
+    vectorstore_provider: Literal["milvus"] = "milvus"
+    milvus_uri: str = "http://localhost:19530"
+    milvus_token: str = ""
+    milvus_collection: str = "arthra_knowledge_chunks"
 
     thingsboard_url: str = "http://localhost:9090"
     thingsboard_username: str = "tenant@thingsboard.org"

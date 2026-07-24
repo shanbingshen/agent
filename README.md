@@ -15,7 +15,7 @@ packages/memory/           Checkpoint 配置契约
 mcp-servers/energy-data/   只读工业数据 MCP JSON-RPC Server
 knowledge/                 原始知识资产、解析产物、元数据和入库记录
 dataset/                   Agent、RAG 与回归评测数据
-deployments/docker/        独立基础设施 Compose 片段，如 Qdrant
+deployments/docker/        独立基础设施 Compose 片段
 ```
 
 迁移期间公开 API、SSE 事件、数据库表、checkpoint namespace、工业数据协议与控制审批链保持兼容。`energy-data` 仅能读取经授权的设备数据；控制 RPC 仍只由 `ControlService` 在人工审批后执行。详情见 [目标架构](docs/architecture/target-architecture.md)、[MCP 工具说明](docs/tools/energy-data-mcp.md) 和 [迁移运行手册](docs/operations/migration-runbook.md)。
@@ -40,7 +40,7 @@ flowchart TB
     Select --> Mock["内置或 JSON Mock"]
     Select --> TB["ThingsBoard"]
     Select --> TS["TimescaleDB / InfluxDB<br/>统一时序 API"]
-    Tools --> RAG["PostgreSQL + pgvector"]
+    Tools --> RAG["Postgres 元数据 + Milvus 向量库"]
     TB --> Device["EMS / 电表 / 空压机"]
     Brain --> Plan["控制计划"]
     Plan --> Approval{"人工审批"}
@@ -95,11 +95,11 @@ AGENTS.md                Agent/开发者协作约束
 
 ## 知识库与 RAG 分工
 
-`knowledge` 是知识资产，不是向量数据库；`packages/rag` 是处理知识的代码层。Agent 不直接读取 `knowledge`、不直接连接 Qdrant/pgvector，也不在自身目录实现 `load_pdf()` 或 `search_vector()`。Agent 通过 `arthra_rag.retrieve(...)` 或 Gateway/Orchestrator 暴露的 RAG Tool 发起检索。
+`knowledge` 是知识资产，不是向量数据库；`packages/rag` 是处理知识的代码层。Agent 不直接读取 `knowledge`、不直接连接 Milvus，也不在自身目录实现 `load_pdf()` 或 `search_vector()`。Agent 通过 `arthra_rag.retrieve(...)` 或 Gateway/Orchestrator 暴露的 RAG Tool 发起检索。
 
 多 Agent 检索范围通过各 Agent 的 `config.yaml` 声明，例如 `agents/compressor-agent/config.yaml` 只允许 `shared` 和 `compressor`，`agents/carbon-agent/config.yaml` 只允许 `shared` 和 `carbon`。客户知识放在 `knowledge/raw/customer/<customer_slug>/`，入库和检索必须带 `tenant_id` 与 `factory_id`。
 
-向量数据库不放入 `knowledge`。本地开发可使用 Compose volume；独立 Qdrant 片段在 `deployments/docker/qdrant.yml`。当前兼容层仍使用已有 PostgreSQL + pgvector 表，后续迁移 Qdrant 时只替换 `packages/rag/src/arthra_rag/vectorstore/` 内部实现。
+向量数据库不放入 `knowledge`。Postgres 只保存知识文档、分片正文、租户/工厂权限和列表元数据；Milvus 保存 chunk 向量、租户/工厂过滤字段和向量索引。生产备份必须同时覆盖 Postgres 数据库与 Milvus 相关 Compose volumes，否则文档列表和向量索引会不一致。旧 pgvector 数据库升级到 Milvus 后不会自动回填历史向量；已有文档需要重新上传或后续单独执行回填脚本。后续替换向量库时只替换 `packages/rag/src/arthra_rag/vectorstore/` 内部实现。
 
 ## 环境要求
 
@@ -165,7 +165,8 @@ docker compose ps
 - `INDUSTRIAL_DATA_PROVIDER`：完整栈默认 `thingsboard`；轻量脚本临时覆盖为 `mock`。
 - `THINGSBOARD_URL`、`THINGSBOARD_USERNAME`、`THINGSBOARD_PASSWORD`：仅在使用 ThingsBoard 或完整 Docker 栈时需要可用。
 - `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`：不填也能跑内置回退；需要真实语义路由和专家解释时再配置。
-- `EMBEDDING_API_KEY`、`EMBEDDING_BASE_URL`、`EMBEDDING_MODEL`、`EMBEDDING_DIMENSIONS`：不填会使用本地演示向量；生产 RAG 应配置正式嵌入模型并保持维度与迁移一致。
+- `EMBEDDING_API_KEY`、`EMBEDDING_BASE_URL`、`EMBEDDING_MODEL`、`EMBEDDING_DIMENSIONS`：不填会使用本地演示向量；生产 RAG 应配置正式嵌入模型并保持维度与 Milvus collection 一致。
+- `MILVUS_URI`、`MILVUS_TOKEN`、`MILVUS_COLLECTION`：RAG 向量库配置。Docker 栈中 API 会使用 `http://milvus-standalone:19530`，本机直连默认使用 `http://localhost:19530`。
 - `DAILY_SUMMARY_ENABLED`：轻量脚本会关闭定时任务；完整栈需要日报时保持 `true` 并确认时区与时间。
 
 启动完成后访问：
@@ -217,6 +218,10 @@ EMBEDDING_DIMENSIONS=384
 RAG_RETRIEVAL_ENABLED=true
 RAG_TOP_K=4
 RAG_MIN_SCORE=0.2
+VECTORSTORE_PROVIDER=milvus
+MILVUS_URI=http://localhost:19530
+MILVUS_TOKEN=
+MILVUS_COLLECTION=arthra_knowledge_chunks
 ```
 
 ### 切换到本地 Ollama
@@ -249,7 +254,7 @@ LLM_BASE_URL=http://host.docker.internal:11434/v1
 EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1
 ```
 
-`EMBEDDING_API_KEY` 必须填写任意非空值，例如 `ollama`，否则系统会走本地演示向量而不会调用 Ollama。`NO_PROXY` 用于避免 `httpx` 或 OpenAI SDK 把本地 Ollama 请求交给系统代理；LR 启动脚本已经默认设置，本机手工运行 `uvicorn` 时需要在 shell 里额外导出同名变量。当前验证过 `qwen3-embedding:0.6b` 可按 `384` 维返回，和项目现有 pgvector 字段匹配。修改 `.env` 后需要重启 API。
+`EMBEDDING_API_KEY` 必须填写任意非空值，例如 `ollama`，否则系统会走本地演示向量而不会调用 Ollama。`NO_PROXY` 用于避免 `httpx` 或 OpenAI SDK 把本地 Ollama 请求交给系统代理；LR 启动脚本已经默认设置，本机手工运行 `uvicorn` 时需要在 shell 里额外导出同名变量。当前验证过 `qwen3-embedding:0.6b` 可按 `384` 维返回，和默认 Milvus collection 维度匹配。修改 `.env` 后需要重启 API。
 
 Supervisor 先使用 `question_answering.py` 中的受控意图表识别高置信问法，再把未登记或含糊问题交给语义模型。路由输出分为三级：`query_mode` 区分知识解释、实时查询、分析、优化、控制请求、会话、越界和澄清；`domain` 区分电表、空压机、EMS、预测、报告和通用领域；`intent` 再选择具体专业能力。输出还包含主题、是否需要工业数据、是否需要澄清、置信度和能力标签，并全部通过严格 Pydantic 模型校验。
 
