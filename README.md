@@ -19,8 +19,9 @@ flowchart TB
     IDS --> Select{"数据源适配器"}
     Select --> Mock["内置或 JSON Mock"]
     Select --> TB["ThingsBoard"]
-    Select --> TS["统一时序 API"]
+    Select --> TS["统一时序 API<br/>TimescaleDB / InfluxDB"]
     Tools --> RAG["Postgres 元数据 + Milvus 向量库"]
+    TB --> Device["EMS / 电表 / 空压机"]
     Brain --> Plan["控制计划"]
     Plan --> Approval{"人工审批"}
     Approval -->|批准且策略校验通过| RPC["ThingsBoard RPC"]
@@ -151,7 +152,7 @@ docker compose ps
 | 能量风险预警 | `apps/api/arthra/power/*` 和首页洞察卡片 | 需量和电能质量来自确定性工具；预测风险需等待真实负荷预测服务 |
 | 空压和电力算法 | `apps/api/arthra/compressor/*`、`apps/api/arthra/power/*` | 阈值优先通过配置维护，pointCode 映射在适配器或时序 API 边界完成 |
 | RAG 知识资产 | `knowledge/raw`、`knowledge/metadata` | 原始资产人工维护；运行时通过知识 API 入库 |
-| RAG 向量库 | Postgres 元数据 + Milvus chunk 向量 | 生产备份必须同时覆盖 Postgres 与 Milvus；embedding 维度需与 collection 一致 |
+| RAG 向量库 | Postgres 元数据 + Milvus chunk 向量 | 生产备份必须同时覆盖 Postgres 与 Milvus；embedding 维度需与 collection 一致；旧 pgvector 数据不会自动回填 |
 | 后端 API 集成 | `/api/v1`、`/openapi.json`、`apps/api/arthra/api.py` | 给第三方界面集成时以 OpenAPI 为契约，保留 JWT、租户、工厂和 RBAC 边界 |
 
 推荐替换顺序：先替换工业数据源，再替换 AI 负荷预测，再维护真实 RAG/Embedding/Milvus，最后校准算法阈值和 pointCode 映射。完整维护说明见 [真实数据维护手册](docs/operations/real-data-maintenance.md)。
@@ -160,7 +161,7 @@ docker compose ps
 
 `knowledge` 是知识资产目录，不是向量数据库。Agent 不直接读取 `knowledge`、不直接连接 Milvus，也不在自身目录实现 `load_pdf()` 或 `search_vector()`；它们只能通过 `arthra_rag.retrieve(...)` 或受控 RAG Tool 检索知识。
 
-多 Agent 检索范围通过各 Agent 的 `config.yaml` 声明。客户知识放在 `knowledge/raw/customer/<customer_slug>/`，入库和检索必须带 `tenant_id` 与 `factory_id`。Postgres 保存文档、分片正文、租户/工厂权限和列表元数据；Milvus 保存 chunk 向量、过滤字段和向量索引。更多边界说明见 [RAG 与知识资产边界](docs/architecture/rag-knowledge-boundary.md)。
+多 Agent 检索范围通过各 Agent 的 `config.yaml` 声明。客户知识放在 `knowledge/raw/customer/<customer_slug>/`，入库和检索必须带 `tenant_id` 与 `factory_id`。Postgres 保存文档、分片正文、租户/工厂权限和列表元数据；Milvus 保存 chunk 向量、过滤字段和向量索引。旧 pgvector 数据升级到 Milvus 后不会自动回填历史向量；已有文档需要重新上传或单独执行回填脚本。更多边界说明见 [RAG 与知识资产边界](docs/architecture/rag-knowledge-boundary.md)。
 
 ## 统一工业数据与算法边界
 
