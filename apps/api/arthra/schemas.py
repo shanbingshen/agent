@@ -91,6 +91,33 @@ class LoadForecastMockResponse(StrictModel):
     points: list[LoadForecastPoint] = Field(min_length=1, max_length=96)
 
 
+class DemandForecastPoint(StrictModel):
+    ts: int = Field(ge=0)
+    label: str = Field(min_length=5, max_length=5)
+    actual_kw: float | None = Field(default=None, ge=0)
+    prediction_kw: float = Field(ge=0)
+    baseline_kw: float = Field(ge=0)
+    lower_kw: float = Field(ge=0)
+    upper_kw: float = Field(ge=0)
+
+
+class DemandForecastResponse(StrictModel):
+    unit: Literal["kW"] = "kW"
+    source: Literal["hybrid_ml"] = "hybrid_ml"
+    generated_at: datetime
+    forecast_date: date
+    method_label: str = Field(min_length=1, max_length=80)
+    data_basis: str = Field(min_length=1, max_length=120)
+    quality_grade: Literal["高", "中高", "中", "低"]
+    validation_mae_kw: float = Field(ge=0)
+    training_samples: int = Field(ge=1)
+    current_slot: int = Field(ge=0, le=95)
+    current_demand_kw: float = Field(ge=0)
+    peak_prediction_kw: float = Field(ge=0)
+    peak_time: str = Field(min_length=5, max_length=5)
+    points: list[DemandForecastPoint] = Field(min_length=96, max_length=96)
+
+
 class ChatPageContext(StrictModel):
     factory_id: uuid.UUID | None = None
     selected_device_ids: list[str] = Field(default_factory=list, max_length=100)

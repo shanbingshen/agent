@@ -110,22 +110,31 @@ export type PowerAnalysisResult = {
   };
 };
 
-export type LoadForecastPoint = {
+export type DemandForecastPoint = {
+  ts: number;
   label: string;
-  actual_mw: number | null;
-  ai_prediction_mw: number;
-  baseline_mw: number;
-  limit_mw: number;
+  actual_kw: number | null;
+  prediction_kw: number;
+  baseline_kw: number;
+  lower_kw: number;
+  upper_kw: number;
 };
 
-export type LoadForecastMockResponse = {
-  unit: "MW";
-  source: "mock";
-  model_name: string;
-  confidence: number;
-  peak_prediction_mw: number;
-  risk_window: string;
-  points: LoadForecastPoint[];
+export type DemandForecastResponse = {
+  unit: "kW";
+  source: "hybrid_ml";
+  generated_at: string;
+  forecast_date: string;
+  method_label: string;
+  data_basis: string;
+  quality_grade: "高" | "中高" | "中" | "低";
+  validation_mae_kw: number;
+  training_samples: number;
+  current_slot: number;
+  current_demand_kw: number;
+  peak_prediction_kw: number;
+  peak_time: string;
+  points: DemandForecastPoint[];
 };
 
 export type CompressorAnalysisResult = {
