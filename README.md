@@ -1,26 +1,8 @@
 # Arthra AI 能碳大脑
 
-Arthra 是一个以 **LangGraph 多专家编排**和**统一工业数据接口**为主线的能碳管理 MVP。它将 EMS、电力、空压机、预测预警和报告专家组织成可持久化工作流，读取侧可切换 ThingsBoard、Mock 或时序 API，并在任何设备控制之前强制进入人工审批。
+Arthra 是一个以 **LangGraph 多专家编排**和**统一工业数据接口**为主线的能碳管理 MVP。它将 EMS、电力、空压机、预测预警和报告专家组织成可持久化工作流，读取侧可切换 ThingsBoard、Mock 或统一时序 API，并在任何设备控制之前强制进入人工审批。
 
-## 渐进式生产架构
-```text
-apps/arthra-gateway/       外部 FastAPI、JWT、RBAC、SSE 与用户线程
-apps/arthra-orchestrator/  LangGraph Checkpoint、主图与 Agent 插件装配
-apps/arthra-scheduler/     每日洞察与定时任务
-agents/main-agent/         主 Agent 图兼容入口、策略与提示词目录
-agents/power-agent/        电力 Agent 工具插件描述
-agents/compressor-agent/   空压机 Agent 工具插件描述
-packages/rag/              摄取、检索与引用组装服务
-packages/memory/           Checkpoint 配置契约
-mcp-servers/energy-data/   只读工业数据 MCP JSON-RPC Server
-knowledge/                 原始知识资产、解析产物、元数据和入库记录
-dataset/                   Agent、RAG 与回归评测数据
-deployments/docker/        独立基础设施 Compose 片段
-```
-
-迁移期间公开 API、SSE 事件、数据库表、checkpoint namespace、工业数据协议与控制审批链保持兼容。`energy-data` 仅能读取经授权的设备数据；控制 RPC 仍只由 `ControlService` 在人工审批后执行。详情见 [目标架构](docs/architecture/target-architecture.md)、[MCP 工具说明](docs/tools/energy-data-mcp.md) 和 [迁移运行手册](docs/operations/migration-runbook.md)。
-
-## 架构
+## 架构总览
 
 ```mermaid
 flowchart TB
@@ -32,14 +14,12 @@ flowchart TB
     Brain --> Air["空压机专家"]
     Brain --> Forecast["预测预警专家"]
     Brain --> Report["报告专家"]
-    Air --> AirContext["空压系统上下文层<br/>设备关联 / 历史对齐 / 数据质量"]
-    Power --> PowerContext["电力数据上下文层<br/>电表历史 / 需量配置 / 数据质量"]
-    EMS & AirContext & PowerContext & Forecast & Report --> Tools["统一只读 Tool"]
+    EMS & Power & Air & Forecast & Report --> Tools["统一只读 Tool"]
     Tools --> IDS["工业数据服务接口"]
     IDS --> Select{"数据源适配器"}
     Select --> Mock["内置或 JSON Mock"]
     Select --> TB["ThingsBoard"]
-    Select --> TS["TimescaleDB / InfluxDB<br/>统一时序 API"]
+    Select --> TS["统一时序 API<br/>TimescaleDB / InfluxDB"]
     Tools --> RAG["Postgres 元数据 + Milvus 向量库"]
     TB --> Device["EMS / 电表 / 空压机"]
     Brain --> Plan["控制计划"]
@@ -48,81 +28,68 @@ flowchart TB
     Approval -->|拒绝/过期/越界| Block["阻止执行并审计"]
 ```
 
-## 功能
+迁移期间公开 API、SSE 事件、数据库表、checkpoint namespace、工业数据协议与控制审批链保持兼容。`energy-data` 仅能读取经授权的设备数据；控制 RPC 仍只由 `ControlService` 在人工审批后执行。详情见 [目标架构](docs/architecture/target-architecture.md)、[MCP 工具说明](docs/tools/energy-data-mcp.md) 和 [迁移运行手册](docs/operations/migration-runbook.md)。
+
+## 核心能力
 
 | 能力 | MVP 实现 |
 | --- | --- |
-| 能力识别 | “问题模式 → 业务领域 → 专业意图”三级路由；高置信受控问法优先匹配，未登记问题使用 Qwen/OpenAI-compatible 语义分类，全部结果经过 Pydantic 校验 |
-| 模型 | OpenAI-compatible 接口，可配置 OpenAI、Qwen、DeepSeek、Ollama 或 vLLM |
-| 状态 | LangGraph PostgreSQL Checkpoint，线程由 `thread_id` 隔离 |
-| 知识库 / RAG | `knowledge` 存放知识资产，`packages/rag` 负责加载、切分、Embedding、检索和引用组装；对话按当前租户与工厂检索，并携带可见引用 |
-| 工业数据 | 统一设备/遥测/属性/告警协议，可配置 ThingsBoard、内置/文件 Mock、通用时序 API |
-| IoT 控制 | ThingsBoard 双向 RPC；读取适配器切换不改变审批和控制安全边界 |
-| 安全控制 | 白名单、参数限幅、10 分钟有效期、RBAC 审批、全链路审计 |
-| 演示数据 | EMS、开山空压机和 ADL400 电表模拟器，按点表上报遥测/属性并响应 RPC |
+| 能力识别 | “问题模式 → 业务领域 → 专业意图”三级路由；高置信受控问法优先匹配，未登记问题使用 OpenAI-compatible 语义分类，全部结果经过 Pydantic 校验 |
+| 工业数据 | 统一设备、遥测、属性、告警协议，可配置 ThingsBoard、内置/文件 Mock、通用时序 API |
+| 知识库 / RAG | `knowledge` 存放知识资产，Postgres 保存文档元数据和分片正文，Milvus 保存 chunk 向量 |
 | AI 每日摘要 | 聚合最近 24 小时遥测、告警与确定性规则，每天自动生成并支持手动刷新 |
-| 空压系统上下文 | 按 `airSystemId` 关联空压机和电表，统一查询24小时历史、时间桶和数据质量 |
-| 空压专家工具 | 实时状态、周期电量、加载/卸载率、空载、启停、压力、高压、比功率、群控、泄漏、节能初筛与效果验证 |
-| 电力专家工具 | 实时功率、周期电量、同期比较、15分钟需量、峰值、峰均比、越限、电压、不平衡、功率因数、THD、谐波和异常持续时间 |
-| 数据契约 | Pydantic v2 严格模型覆盖统一工业数据、外部适配器投影、Agent、领域上下文、控制、日报、知识与审计 |
+| 空压专家 | 实时状态、周期电量、加载/卸载率、空载、启停、压力、高压、比功率、群控、泄漏、节能筛查与效果验证 |
+| 电力专家 | 实时功率、周期电量、同期比较、15 分钟需量、峰值、峰均比、越限、电压、不平衡、功率因数、THD、谐波和异常持续时间 |
+| 安全控制 | 控制计划白名单、参数限幅、10 分钟有效期、RBAC 审批、全链路审计 |
 | 控制台 | 能源总览、每日摘要、SSE 对话、知识库、控制审批和审计页面 |
 
-## 目录
+## 目录地图
 
 ```text
-apps/api/               FastAPI、LangGraph、数据模型与 Alembic
-apps/api/arthra/contracts.py 共享严格模型、JSON/遥测值类型、告警与引用契约
-apps/api/arthra/thingsboard_schemas.py ThingsBoard 外部响应投影与 RPC 契约
-apps/api/arthra/industrial_data/ 统一工业数据模型、Protocol、服务、工厂和三类适配器
-apps/api/arthra/agent_schemas.py 通用设备上下文和专家分析契约
-apps/api/arthra/question_answering.py 受控问答意图、工具白名单、设备编号和时间窗口解析
-apps/api/arthra/daily_schemas.py 每日摘要统计、设备、告警和快照契约
-apps/api/arthra/compressor/ 空压系统上下文、质量检查、确定性特征和只读工具
-apps/api/arthra/power/      电力数据上下文、需量/电能质量确定性算法和只读工具
-apps/web/               React + TypeScript 控制台
-services/simulator/     ThingsBoard 三设备遥测/RPC 模拟器
-packages/rag/src/arthra_rag/ RAG 引擎代码：loaders、splitter、embeddings、vectorstore、retriever、reranker、pipeline、evaluation
-knowledge/raw/          人工维护的 PDF/DOCX/MD/TXT 等原始知识，按 shared、ems、power、compressor、carbon、customer 分域
-knowledge/processed/    解析后的 documents.jsonl 与 chunks.jsonl
-knowledge/metadata/     人工维护的设备、标准和客户元数据
-knowledge/manifests/    入库运行记录、版本和索引血缘
-dataset/                agent-eval、rag-eval 和 regression 数据集
-tests/                  路由、安全策略、知识切分与密码测试
-docker-compose.yml      完整本地运行栈
-.env.example            可提交的环境变量模板
-AGENTS.md                Agent/开发者协作约束
+apps/api/                         FastAPI、兼容路由、数据模型与 Alembic
+apps/api/arthra/industrial_data/  统一工业数据模型、Protocol、服务、工厂和适配器
+apps/api/arthra/compressor/       空压系统上下文、确定性算法和只读工具
+apps/api/arthra/power/            电力数据上下文、需量/电能质量确定性算法和只读工具
+apps/arthra-gateway/              外部 FastAPI、JWT、RBAC、SSE 与用户线程
+apps/arthra-orchestrator/         LangGraph Checkpoint、主图与 Agent 插件装配
+apps/arthra-scheduler/            每日洞察与定时任务
+apps/web/                         React + TypeScript 控制台
+agents/*                          Agent 配置、知识域和插件描述
+packages/rag/                     RAG 摄取、检索、引用组装和向量库适配代码
+knowledge/                        原始知识资产、解析产物、人工元数据和入库记录
+dataset/                          Agent、RAG 与回归评测数据
+docs/                             架构、运维、工具和协作说明
 ```
 
-## 知识库与 RAG 分工
+更多目录边界见 [docs/README.md](docs/README.md)。
 
-`knowledge` 是知识资产，不是向量数据库；`packages/rag` 是处理知识的代码层。Agent 不直接读取 `knowledge`、不直接连接 Milvus，也不在自身目录实现 `load_pdf()` 或 `search_vector()`。Agent 通过 `arthra_rag.retrieve(...)` 或 Gateway/Orchestrator 暴露的 RAG Tool 发起检索。
-
-多 Agent 检索范围通过各 Agent 的 `config.yaml` 声明，例如 `agents/compressor-agent/config.yaml` 只允许 `shared` 和 `compressor`，`agents/carbon-agent/config.yaml` 只允许 `shared` 和 `carbon`。客户知识放在 `knowledge/raw/customer/<customer_slug>/`，入库和检索必须带 `tenant_id` 与 `factory_id`。
-
-向量数据库不放入 `knowledge`。Postgres 只保存知识文档、分片正文、租户/工厂权限和列表元数据；Milvus 保存 chunk 向量、租户/工厂过滤字段和向量索引。生产备份必须同时覆盖 Postgres 数据库与 Milvus 相关 Compose volumes，否则文档列表和向量索引会不一致。旧 pgvector 数据库升级到 Milvus 后不会自动回填历史向量；已有文档需要重新上传或后续单独执行回填脚本。后续替换向量库时只替换 `packages/rag/src/arthra_rag/vectorstore/` 内部实现。
-
-## 环境要求
-
-- Docker Desktop 与 Docker Compose v2
-- 本地开发可选：Python 3.12、uv 0.11+、Node.js 24、pnpm 11
-- 建议至少 8 GB 可用内存；ThingsBoard 首次初始化需要数分钟
-
-> 当前 Windows 环境曾出现 Docker 无法读取 `C:\Users\Aethr\.docker\config.json` 的警告。若启动失败，请先在 Docker Desktop 中确认引擎已运行，并修复该文件的读取权限。项目不会自动删除或覆盖用户 Docker 配置。
-
-## 新电脑快速启动
+## 快速启动
 
 本项目提供两类启动方式：
 
 - 轻量调试：`start-lr.command`（macOS）或 `start-lr-windows.cmd`（Windows），使用 LR Python 环境、SQLite 临时库和 mock 工业数据，不需要 Docker、PostgreSQL 或 ThingsBoard。
-- 完整栈：`docker compose up -d --build`，启动 PostgreSQL、ThingsBoard、API、前端和模拟器。
+- 完整栈：`docker compose up -d --build`，启动 PostgreSQL、Milvus、ThingsBoard、API、前端和模拟器。
 
-首次在新电脑运行前，先完成这些本地准备：
+首次在新电脑运行前，先准备 Python 3.12、Node.js、pnpm，并执行：
 
-1. 安装 Python 3.12 环境并准备项目依赖。若使用现有命名，建议创建 `LR` 环境；脚本默认查找 macOS `/Users/aethravolt007/miniforge3/envs/LR/bin/python` 或 Windows `%USERPROFILE%\miniforge3\envs\LR\python.exe`。
-2. 安装 Node.js 与 pnpm，并执行 `pnpm --dir apps/web install`。
-3. 复制环境模板：`Copy-Item .env.example .env`（Windows PowerShell）或 `cp .env.example .env`（macOS/zsh）。
-4. 通常不需要修改启动脚本路径。macOS 脚本默认使用自身所在目录作为项目根目录；Windows 的 `start-lr-windows.cmd` 会把自身目录传给 PowerShell 脚本。若工具路径不同，可在启动前用环境变量覆盖：`ARTHRA_ROOT`、`LR_PY`、`PNPM`、`NODE_BIN`。
-5. 保持默认端口时无需再改前端配置：API 是 `18089`，Web 是 `18090`。如端口被占用，可在启动前设置 `API_PORT`、`WEB_PORT`；轻量脚本会同步设置运行时 `CORS_ORIGINS` 和 `VITE_API_BASE_URL`。
+```zsh
+pnpm --dir apps/web install
+cp .env.example .env
+```
+
+Windows 可用 PowerShell：
+
+```powershell
+pnpm --dir apps/web install
+Copy-Item .env.example .env
+```
+
+轻量启动：
+
+```zsh
+chmod +x ./start-lr.command
+./start-lr.command
+```
 
 Windows 轻量启动：
 
@@ -130,356 +97,105 @@ Windows 轻量启动：
 .\start-lr-windows.cmd
 ```
 
-macOS 轻量启动：
-
-```zsh
-chmod +x ./start-lr.command
-./start-lr.command
-```
-
-轻量脚本启动后访问：
-
-- Arthra 控制台：[http://127.0.0.1:18090](http://127.0.0.1:18090)
-- Arthra API/Swagger：[http://127.0.0.1:18089/docs](http://127.0.0.1:18089/docs)
-
-启动成功后脚本会自动打开前端控制台；如果自动打开失败，终端会打印可手动访问的 URL。macOS 脚本会在 Vite/esbuild 因本地签名问题无法执行时尝试自动修复。若登录页出现 `Failed to fetch`，优先检查后端是否已经启动成功：打开 [http://127.0.0.1:18089/api/v1/health](http://127.0.0.1:18089/api/v1/health)，再查看 `.local-dev/logs/api-lr*.log` 和 `.local-dev/logs/web-lr*.log`。
-
-## Docker 一键启动
+Docker 完整栈：
 
 ```powershell
-Copy-Item .env.example .env
-# 修改 .env 中的 APP_SECRET_KEY、管理员密码和可选模型配置
 docker compose up -d --build
 docker compose ps
 ```
 
-本仓库已附带仅用于本地演示的 `.env`；任何共享或部署前都必须修改其中密钥。
+默认访问地址：
 
-`.env.example` 复制为 `.env` 后，至少检查这些配置：
+- Arthra 控制台：[http://127.0.0.1:18090](http://127.0.0.1:18090)
+- Arthra API/Swagger：[http://127.0.0.1:18089/docs](http://127.0.0.1:18089/docs)
+- OpenAPI JSON：[http://127.0.0.1:18089/openapi.json](http://127.0.0.1:18089/openapi.json)
+- ThingsBoard（完整栈）：[http://localhost:9090](http://localhost:9090)
 
-- `APP_SECRET_KEY`：必须换成新的长随机值，不能使用模板值。
-- `BOOTSTRAP_ADMIN_EMAIL`、`BOOTSTRAP_ADMIN_PASSWORD`：新电脑本地可沿用演示账号，任何共享环境必须修改。
-- `CORS_ORIGINS`：必须包含前端实际地址，默认是 `http://localhost:18090,http://127.0.0.1:18090`。
-- `VITE_API_BASE_URL`：必须指向浏览器可访问的 API，默认是 `http://localhost:18089/api/v1`。
-- `DATABASE_URL`、`LANGGRAPH_DATABASE_URL`：Docker 使用 Compose 服务名；本地直连 PostgreSQL 时改成本机数据库地址。LR 轻量脚本会临时覆盖为 SQLite。
-- `INDUSTRIAL_DATA_PROVIDER`：完整栈默认 `thingsboard`；轻量脚本临时覆盖为 `mock`。
-- `THINGSBOARD_URL`、`THINGSBOARD_USERNAME`、`THINGSBOARD_PASSWORD`：仅在使用 ThingsBoard 或完整 Docker 栈时需要可用。
-- `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`：不填也能跑内置回退；需要真实语义路由和专家解释时再配置。
-- `EMBEDDING_API_KEY`、`EMBEDDING_BASE_URL`、`EMBEDDING_MODEL`、`EMBEDDING_DIMENSIONS`：不填会使用本地演示向量；生产 RAG 应配置正式嵌入模型并保持维度与 Milvus collection 一致。
-- `MILVUS_URI`、`MILVUS_TOKEN`、`MILVUS_COLLECTION`：RAG 向量库配置。Docker 栈中 API 会使用 `http://milvus-standalone:19530`，本机直连默认使用 `http://localhost:19530`。
-- `DAILY_SUMMARY_ENABLED`：轻量脚本会关闭定时任务；完整栈需要日报时保持 `true` 并确认时区与时间。
-
-启动完成后访问：
-
-- Arthra 控制台：[http://localhost:18090](http://localhost:18090)
-- Arthra API/Swagger：[http://localhost:18089/docs](http://localhost:18089/docs)
-- ThingsBoard：[http://localhost:9090](http://localhost:9090)
-
-默认演示账号：
+演示账号：
 
 | 系统 | 账号 | 密码 |
 | --- | --- | --- |
 | Arthra | `admin@arthra.local` | `Arthra@123456` |
 | ThingsBoard Tenant | `tenant@thingsboard.org` | `tenant` |
 
-查看日志或停止：
+轻量脚本会自动使用自身目录作为项目根目录、临时覆盖为 mock 数据源、自动打开前端；macOS 下会在 Vite/esbuild 因本地签名问题无法执行时尝试自动修复。完整启动、模型、Ollama、环境变量和排障细节见 [本地运行手册](docs/operations/local-runbook.md)。
 
-```powershell
-docker compose logs -f api simulator thingsboard
-docker compose down
-```
+## 关键配置
 
-## 模型配置
+`.env.example` 复制为 `.env` 后至少检查：
 
-对话模型与嵌入模型独立配置。两者都遵循 OpenAI-compatible API：
+| 配置 | 用途 |
+| --- | --- |
+| `APP_SECRET_KEY` | 任何共享或部署环境必须换成长随机值 |
+| `BOOTSTRAP_ADMIN_EMAIL` / `BOOTSTRAP_ADMIN_PASSWORD` | 启动时创建默认管理员 |
+| `CORS_ORIGINS` / `VITE_API_BASE_URL` | 前端与 API 地址 |
+| `DATABASE_URL` / `LANGGRAPH_DATABASE_URL` | 业务数据库和 LangGraph checkpoint |
+| `INDUSTRIAL_DATA_PROVIDER` | `thingsboard`、`mock` 或 `timeseries_api` |
+| `INDUSTRIAL_DATA_MOCK_FILE` | 可选 JSON Mock 数据文件；空值使用内置确定性数据 |
+| `TIMESERIES_API_URL` / `TIMESERIES_API_TOKEN` | 接入自建时序服务 |
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | OpenAI-compatible 对话模型 |
+| `EMBEDDING_API_KEY` / `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` | RAG embedding；默认维度 384 |
+| `MILVUS_URI` / `MILVUS_TOKEN` / `MILVUS_COLLECTION` | RAG 向量库 |
+| `DAILY_SUMMARY_ENABLED` / `DAILY_SUMMARY_HOUR` / `DAILY_SUMMARY_TIMEZONE` | 每日摘要定时任务 |
 
-```dotenv
-LLM_API_KEY=your-key
-LLM_BASE_URL=https://api.deepseek.com/v1
-LLM_MODEL=deepseek-chat
+完整配置说明见 [本地运行手册](docs/operations/local-runbook.md)。
 
-# Supervisor 默认复用上述模型，也可单独指定更轻量的分类模型
-SUPERVISOR_SEMANTIC_ROUTING_ENABLED=true
-SUPERVISOR_LLM_MODEL=
-SUPERVISOR_ROUTE_CONFIDENCE_THRESHOLD=0.65
+## 演示/Mock 到真实系统维护地图
 
-# 空压机专家和电力与需量专家默认复用 LLM_MODEL，也可分别指定千问模型
-COMPRESSOR_EXPERT_LLM_ENABLED=true
-COMPRESSOR_EXPERT_LLM_MODEL=
-POWER_EXPERT_LLM_ENABLED=true
-POWER_EXPERT_LLM_MODEL=
+当前需要后续真实化维护的内容集中在以下位置：
 
-EMBEDDING_API_KEY=your-embedding-key
-EMBEDDING_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-EMBEDDING_MODEL=text-embedding-v4
-EMBEDDING_DIMENSIONS=384
-
-# RAG：每次对话最多引用 4 个达到相关度阈值的当前工厂文档片段
-RAG_RETRIEVAL_ENABLED=true
-RAG_TOP_K=4
-RAG_MIN_SCORE=0.2
-VECTORSTORE_PROVIDER=milvus
-MILVUS_URI=http://localhost:19530
-MILVUS_TOKEN=
-MILVUS_COLLECTION=arthra_knowledge_chunks
-```
-
-### 切换到本地 Ollama
-
-Ollama 不是默认配置；只有在 `.env` 中显式替换模型配置后才会启用。先确认本机已启动 Ollama，并且已拉取模型：
-
-```powershell
-ollama list
-curl http://127.0.0.1:11434/v1/models
-```
-
-本机直接运行 LR 脚本时，把 `.env` 中模型段改为：
-
-```dotenv
-LLM_API_KEY=ollama
-LLM_BASE_URL=http://127.0.0.1:11434/v1
-LLM_MODEL=qwen3.5:9b-q4_K_M
-NO_PROXY=127.0.0.1,localhost
-
-EMBEDDING_API_KEY=ollama
-EMBEDDING_BASE_URL=http://127.0.0.1:11434/v1
-EMBEDDING_MODEL=qwen3-embedding:0.6b
-EMBEDDING_DIMENSIONS=384
-```
-
-如果 API 跑在 Docker 容器里，而 Ollama 跑在宿主机上，将两个 base URL 改为：
-
-```dotenv
-LLM_BASE_URL=http://host.docker.internal:11434/v1
-EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1
-```
-
-`EMBEDDING_API_KEY` 必须填写任意非空值，例如 `ollama`，否则系统会走本地演示向量而不会调用 Ollama。`NO_PROXY` 用于避免 `httpx` 或 OpenAI SDK 把本地 Ollama 请求交给系统代理；LR 启动脚本已经默认设置，本机手工运行 `uvicorn` 时需要在 shell 里额外导出同名变量。当前验证过 `qwen3-embedding:0.6b` 可按 `384` 维返回，和默认 Milvus collection 维度匹配。修改 `.env` 后需要重启 API。
-
-Supervisor 先使用 `question_answering.py` 中的受控意图表识别高置信问法，再把未登记或含糊问题交给语义模型。路由输出分为三级：`query_mode` 区分知识解释、实时查询、分析、优化、控制请求、会话、越界和澄清；`domain` 区分电表、空压机、EMS、预测、报告和通用领域；`intent` 再选择具体专业能力。输出还包含主题、是否需要工业数据、是否需要澄清、置信度和能力标签，并全部通过严格 Pydantic 模型校验。
-
-RAG 只检索已上传到当前租户和工厂的 UTF-8 文本、Markdown 或 CSV 文档。检索片段会作为来源返回，并只能补充规程、设备说明和企业知识；实时数据计算、越限判断与控制计划仍完全由确定性工具和既有审批流程负责。
-
-知识解释统一进入 `KNOWLEDGE_EXPLANATION`，例如“什么是比功率”不会读取 ThingsBoard 或执行专家工具，而由模型在工业知识边界内简短解释；“这台空压机比功率是多少”则进入 `COMPRESSOR_SPECIFIC_POWER` 并调用确定性工具。问候、感谢、能力询问和非工业能源问题进入 `conversation`，不会读取设备、执行专家工具或生成能源报告；未识别到工业能源意图时也默认进入该安全边界；控制请求只识别诉求并提示创建待审批计划。模型返回非法 JSON、非法分类、置信度低于阈值或调用失败时，自动退回受控意图或中英文关键词路由。未配置 `LLM_API_KEY` 时，平台、设备、路由和知识解释的内置安全回退仍可运行；未配置嵌入 API 时使用确定性的本地演示向量，生产环境应配置正式嵌入模型并保持 384 维，或同时修改迁移中的向量维度。
-
-空压机专家和电力与需量专家采用“确定性工具计算 + 千问解释”的两层输出：所有指标、阈值、告警和数据质量先由 Python 工具生成严格 Pydantic 结果，千问只读取面向客户的确定性报告并补充简短专业解读，不负责重新计算。客户模式不展示基础模型名称；管理员调试模式才显示模型版本。模型未配置、被禁用、返回空内容或调用失败时，会自动退回确定性报告，不影响分析工具使用。
-
-### 客户模式与管理员调试模式
-
-Agent 对话默认使用客户模式。事实查询采用直接回答，例如“峰值 + 发生时间”或“周期电量 + 数据完整率”；只有综合分析才使用“一句话结论、核心指标、关键异常与证据、可执行建议”四层结构。客户模式不展示基础模型名称、设备 UUID、原始点位字段、规则编码或小数形式的内部置信度；数据完整度和结论可信度使用高/中高/中/低表达。管理员可在 AI 分析页面显式开启调试模式，查看结构化分析、设备 ID、规则编号和模型版本，非管理员请求 `debug=true` 会被 API 拒绝。
-
-### 定向问答与工具白名单
-
-每条已登记问法都定义了严格的 `intent / route / capabilities / max_tool_calls`。一次问答最多执行 4 个只读工具，不再默认运行专家的全部能力。例如：
-
-| 用户问题 | 专家 | 实际工具 |
+| 项 | 当前位置 | 替换维护方式 |
 | --- | --- | --- |
-| 昨天什么时候用电负荷最高？ | 电力 | `detect_power_peaks` |
-| 分析过去24小时的15分钟最大需量和峰均比 | 电力 | `calculate_rolling_15m_max_demand`、`analyze_peak_average_ratio` |
-| 1号空压机昨天卸载严重吗？ | 空压 | `analyze_compressor_load_unload_rate` |
-| 空压异常造成多少电费浪费？ | 空压 | `estimate_compressor_energy_saving`；没有电价时拒绝换算金额 |
-| 你好 / 非工业问题 | 对话边界 | 不读取设备，不执行工具 |
+| 工业 mock 数据 | `apps/api/arthra/industrial_data/adapters/mock_file.py` | 用 `INDUSTRIAL_DATA_MOCK_FILE` 指向 JSON 文件做过渡；生产推荐切到 `thingsboard` 或 `timeseries_api` |
+| AI 负荷预测 mock | `GET /api/v1/load-forecast/mock` 和 `apps/web/src/App.tsx` | 新增真实 forecast service/API 后替换前端调用，不再使用静态预测曲线 |
+| 工厂能耗分析 / 每日摘要 | `apps/api/arthra/daily_summary.py` | 算法读取统一工业数据接口；真实化优先切换工业数据源，不让摘要直接读外部数据库 |
+| 能量风险预警 | `apps/api/arthra/power/*` 和首页洞察卡片 | 需量和电能质量来自确定性工具；预测风险需等待真实负荷预测服务 |
+| 空压和电力算法 | `apps/api/arthra/compressor/*`、`apps/api/arthra/power/*` | 阈值优先通过配置维护，pointCode 映射在适配器或时序 API 边界完成 |
+| RAG 知识资产 | `knowledge/raw`、`knowledge/metadata` | 原始资产人工维护；运行时通过知识 API 入库 |
+| RAG 向量库 | Postgres 元数据 + Milvus chunk 向量 | 生产备份必须同时覆盖 Postgres 与 Milvus；embedding 维度需与 collection 一致；旧 pgvector 数据不会自动回填 |
+| 后端 API 集成 | `/api/v1`、`/openapi.json`、`apps/api/arthra/api.py` | 给第三方界面集成时以 OpenAPI 为契约，保留 JWT、租户、工厂和 RBAC 边界 |
 
-时间表达会转换为带时区的查询窗口；“昨天”表示 `Asia/Shanghai` 的完整自然日。未指定时间时，回答会明确标注默认使用最近24小时。提到“3号电表/2号空压机”等具体对象但设备不存在或未在页面选中时，系统会追问，不会自动替换成相近设备。
+推荐替换顺序：先替换工业数据源，再替换 AI 负荷预测，再维护真实 RAG/Embedding/Milvus，最后校准算法阈值和 pointCode 映射。完整维护说明见 [真实数据维护手册](docs/operations/real-data-maintenance.md)。
 
-需量越限唯一判定口径是 `meter_TotW` 的15分钟滚动平均与“需量控制目标”（内部字段 `declaredDemandKw`）的比较。实时功率或60秒桶峰值超过需量控制目标不等于计费需量已经越限；电表 `meter_MaxDmdSupW` 寄存器在统计周期未确认时不用于对话中的越限结论。电流不平衡、THDu/THDi阈值属于平台内部预警，客户报告会标记为疑似异常或待核验，不直接宣称符合某项标准的超限结论。
+## 知识库与 RAG 边界
 
-## 统一工业数据源配置
+`knowledge` 是知识资产目录，不是向量数据库。Agent 不直接读取 `knowledge`、不直接连接 Milvus，也不在自身目录实现 `load_pdf()` 或 `search_vector()`；它们只能通过 `arthra_rag.retrieve(...)` 或受控 RAG Tool 检索知识。
 
-Agent 和专家工具只依赖 `IndustrialDataService`，不会导入 ThingsBoard、TimescaleDB 或 InfluxDB 客户端。通过环境变量选择读取数据源：
+多 Agent 检索范围通过各 Agent 的 `config.yaml` 声明。客户知识放在 `knowledge/raw/customer/<customer_slug>/`，入库和检索必须带 `tenant_id` 与 `factory_id`。Postgres 保存文档、分片正文、租户/工厂权限和列表元数据；Milvus 保存 chunk 向量、过滤字段和向量索引。旧 pgvector 数据升级到 Milvus 后不会自动回填历史向量；已有文档需要重新上传或单独执行回填脚本。更多边界说明见 [RAG 与知识资产边界](docs/architecture/rag-knowledge-boundary.md)。
 
-```dotenv
-# 当前默认：读取 ThingsBoard，模拟器仍可向 ThingsBoard 上报演示数据
-INDUSTRIAL_DATA_PROVIDER=thingsboard
+## 统一工业数据与算法边界
 
-# 无需外部服务，自动生成最近24小时的 EMS、电表和空压机确定性数据
-# INDUSTRIAL_DATA_PROVIDER=mock
-# INDUSTRIAL_DATA_MOCK_FILE=
+Agent 和专家工具只依赖 `IndustrialDataService`，不会导入 ThingsBoard、TimescaleDB 或 InfluxDB 客户端。统一时序 API 需要实现 `/devices`、`/devices/{id}/telemetry/latest`、`/devices/{id}/telemetry/history`、`/devices/{id}/attributes`、`/devices/{id}/alarms`。
 
-# 接入自建时序数据库查询 API
-# INDUSTRIAL_DATA_PROVIDER=timeseries_api
-# TIMESERIES_API_URL=http://timeseries-service:8080/api/v1
-# TIMESERIES_API_TOKEN=replace-me
-# TIMESERIES_API_TIMEOUT=15
-```
+底层字段名不一致时，应在时序 API 或适配器内映射为 Arthra pointCode，例如 `active_power_kw -> meter_TotW`。单位换算、缺失值处理、聚合语义和阈值判定不得交给 Agent 或 LLM。空压机、电力和定向问答工具清单见 [领域确定性工具说明](docs/tools/domain-analysis-tools.md)。
 
-统一时序 API 需要实现以下只读端点：
+## 后端 API 集成
 
-| 方法 | 端点 | 返回模型 |
-| --- | --- | --- |
-| GET | `/devices` | `IndustrialDevicePage` |
-| GET | `/devices/{id}/telemetry/latest` | `IndustrialTelemetryHistory` |
-| GET | `/devices/{id}/telemetry/history` | `IndustrialTelemetryHistory` |
-| GET | `/devices/{id}/attributes` | `AttributeValues` |
-| GET | `/devices/{id}/alarms` | `IndustrialAlarmPage` |
+公开 API 入口：
 
-历史时序的标准 JSON 为 `{"meter_TotW":[{"ts":毫秒时间戳,"value":95.15}]}`。底层字段名不一致时，应在时序 API 或适配器内映射为 Arthra pointCode；例如 `active_power_kw → meter_TotW`。单位换算、缺失值处理和聚合语义不得交给 Agent 或 LLM。`GET /api/v1/health` 会返回当前 `industrial_data_provider`。
+- Swagger：[http://localhost:18089/docs](http://localhost:18089/docs)
+- OpenAPI JSON：[http://localhost:18089/openapi.json](http://localhost:18089/openapi.json)
+- 健康检查：`GET /api/v1/health`
 
-数据读取与设备控制是两条独立链路：更换读取 provider 不会让 Agent 获得控制权限；RPC 仍只能由 `ControlService` 在审批、有效期、白名单和限幅校验通过后调用 ThingsBoard。
+常用集成接口：
 
-每日摘要默认按 `Asia/Shanghai` 时区在每天 08:00 自动生成，统计窗口为生成时刻向前 24 小时。可通过以下环境变量调整：
+| 能力 | 接口 |
+| --- | --- |
+| 登录 | `POST /api/v1/auth/login` |
+| 当前用户 | `GET /api/v1/auth/me` |
+| 工厂 | `GET /api/v1/factories` |
+| 设备 | `GET /api/v1/devices` |
+| 遥测 | `GET /api/v1/devices/{device_id}/telemetry` |
+| 告警 | `GET /api/v1/devices/{device_id}/alarms` |
+| Agent 对话 | `POST /api/v1/chat` |
+| 知识库 | `/api/v1/knowledge/...` |
+| 控制计划 | `/api/v1/control-plans...` |
 
-```dotenv
-DAILY_SUMMARY_ENABLED=true
-DAILY_SUMMARY_HOUR=8
-DAILY_SUMMARY_TIMEZONE=Asia/Shanghai
-```
-
-摘要中的最小值、最大值、平均值、用电增量和规则提醒由 Python 确定性计算；LLM 只负责组织中文报告。模型不可用时仍会保存确定性摘要。
-
-累计电量 `meter_SupWh` 在进入摘要前会与同窗口 `meter_TotW × 有效观测时长` 交叉校验；若比值超出允许范围，摘要将把电量状态标记为 `invalid` 并拒绝输出错误电量。平均功率同时提供历史样本覆盖率。模拟器只在最近窗口没有历史时播种一次数据，容器重启不会重复灌入同一批历史。
-
-## API 示例
-
-登录：
-
-```powershell
-$login = Invoke-RestMethod -Method Post -Uri http://localhost:18089/api/v1/auth/login `
-  -ContentType application/json `
-  -Body '{"email":"admin@arthra.local","password":"Arthra@123456"}'
-$headers = @{ Authorization = "Bearer $($login.access_token)" }
-Invoke-RestMethod http://localhost:18089/api/v1/devices -Headers $headers
-```
-
-调用空压系统上下文分析（`device_scope` 只需传空压机，系统会通过 `airSystemId` 自动关联电表）：
-
-```powershell
-$body = @{
-  message = "分析加载率、空载、频繁启停、压力波动和比功率"
-  device_scope = @("ThingsBoard-compressor-device-uuid")
-  capabilities = @("load_rate", "idle_running", "frequent_start", "pressure_fluctuation", "specific_power")
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post http://localhost:18089/api/v1/compressor-analysis `
-  -Headers $headers -ContentType application/json -Body $body
-```
-
-### 空压机十二项确定性工具
-
-空压机 Agent 已注册以下只读工具。每个工具只激活一项 capability，数值由 Python 确定性计算，LLM 只负责解释结果。
-
-| 工具 | capability | 主要输出 |
-| --- | --- | --- |
-| `analyze_compressor_load_unload_rate` | `load_rate` | 加载率、卸载率、运行/加载/卸载时长、覆盖率 |
-| `detect_compressor_idle_running` | `idle_running` | 累计空载时间、最长连续空载时间；告警按最长连续时长判定 |
-| `detect_compressor_frequent_starts` | `frequent_start` | 启动次数、有效观测小时数、每小时启动频率、频繁启停告警 |
-| `analyze_compressor_pressure_fluctuation` | `pressure_fluctuation` | P5、P95、标准差、P95-P5 波动及告警 |
-| `detect_compressor_high_supply_pressure` | `high_pressure` | 最大压力、超过上限的累计时间及告警 |
-| `calculate_compressor_specific_power` | `specific_power` | 平均比功率、P95 比功率、功率/流量对齐样本数 |
-| `get_compressor_realtime` | `realtime_status` | 运行/加载状态、压力、温度、关联功率和活动告警 |
-| `get_compressor_energy` | `energy_consumption` | 关联电表累计读数差和周期用电量 |
-| `analyze_compressor_group_control` | `group_control` | 多机加载顺序与群控筛查建议 |
-| `detect_compressor_leakage` | `leakage` | 非生产时段平均流量和泄漏迹象 |
-| `estimate_compressor_energy_saving` | `savings` | 卸载能耗和可优化电量筛查值 |
-| `verify_compressor_optimization` | `verification` | 基线、措施时间和验证周期完备性 |
-
-用户询问这些指标时，Supervisor 路由至空压机专家，专家节点根据意图白名单只执行相应能力。十二个工具共享严格时间窗口输入，具体 Pydantic 类各自独立，禁止额外字段。
-
-生产对话链路已接入 LangGraph `ToolNode`：Supervisor 给出的 capability 先经过服务端白名单校验，服务端生成工具调用，模型不能填写或修改设备 UUID。多个能力会先合并所需遥测 key、通过工业数据服务只构建一次 `CompressorSystemContext`，再通过 `InjectedState` 注入对应工具计算。工具返回采用 `content_and_artifact`，收集节点只接受通过 Pydantic 校验的 `CompressorAnalysisResult`。最终文字由结构化事实、告警代码和有证据的建议确定性渲染，避免 LLM 新增阈值或缺失结论。
-
-Chat SSE 会为每个完成的工具发送精简事件，不包含原始时序、ThingsBoard 凭据或请求头：
-
-```text
-event: tool
-data: {"tool_name":"analyze_compressor_load_unload_rate","status":"success","capabilities":["load_rate"],"data_status":"available"}
-```
-
-输入 JSON：
-
-```json
-{
-  "device_scope": ["ThingsBoard-compressor-device-uuid"],
-  "start_at": "2026-07-16T00:00:00+08:00",
-  "end_at": "2026-07-17T00:00:00+08:00",
-  "interval_seconds": 180
-}
-```
-
-优先按对齐后的 `air_comp_running_flag` 与 `air_comp_loaded_flag` 计算：`加载率 = 加载等效时长 / 运行等效时长 × 100%`，`卸载率 = 100% - 加载率`。状态位不足时自动回退到 `air_comp_loading_hours` 与 `air_comp_running_hours` 的窗口差值。输出包含计算方法、对齐样本数、样本覆盖率、运行/加载/卸载分钟数、阈值判定和缺失数据；不会由 LLM 猜测数值。
-
-也可通过综合分析 API 显式只执行此能力：
-
-```json
-{
-  "message": "分析单机加载率和卸载率",
-  "device_scope": ["ThingsBoard-compressor-device-uuid"],
-  "capabilities": ["load_rate"]
-}
-```
-
-默认查询最近24小时并使用3分钟聚合桶；统一数据适配器负责遵守底层查询限制，领域上下文保持相同的时间桶语义。返回结果包含数据覆盖率、设备关系、确定性指标、证据、缺失项和置信度，原始时序不会发送给 LLM。
-
-### 电力需量与电能质量十三项确定性工具
-
-电力专家使用 `apps/api/arthra/power` 中独立的数据上下文层和十三个 LangGraph 工具：
-
-| 工具 | capability | 确定性输入/输出 |
-| --- | --- | --- |
-| `get_meter_realtime` | `realtime_power` | 最新 `meter_TotW` 和数据时间 |
-| `get_energy_consumption` | `energy_consumption` | `meter_SupWh` 期末值减期初值 |
-| `compare_energy_periods` | `energy_compare` | 相邻周期电量、变化量和变化率 |
-| `calculate_rolling_15m_max_demand` | `demand_15m` | `meter_TotW`；15分钟滚动均值、最大值与窗口时间 |
-| `detect_power_peaks` | `peak_detection` | `meter_TotW`；局部峰值与时间戳 |
-| `analyze_peak_average_ratio` | `peak_average_ratio` | 瞬时峰值 / 窗口平均负荷 |
-| `detect_declared_demand_exceedance` | `declared_demand_exceedance` | 滚动需量、`declaredDemandKw`；越限量、比例和持续时间 |
-| `detect_voltage_deviation` | `voltage_deviation` | 三相线电压、额定电压；最大偏差与持续时间 |
-| `detect_three_phase_imbalance` | `phase_imbalance` | `meter_ImbNgV/A`；电压/电流不平衡越限 |
-| `detect_power_factor_anomaly` | `power_factor` | `meter_TotPF`；低功率因数持续时间 |
-| `detect_thdu_thdi_anomaly` | `thd` | 三相 THDu/THDi；最大值与越限持续时间 |
-| `analyze_3_5_7_harmonics` | `harmonics` | 三相3/5/7次电压和电流谐波；均值、最大值、主导次数 |
-| `calculate_power_quality_abnormal_duration` | `abnormal_duration` | 上述质量指标；累计与最长连续异常时间 |
-
-`POWER_*` 环境变量配置需量控制目标、额定电压和各项阈值。需量控制目标可来源于合同/申报需量：优先使用请求中的 `declared_demand_kw`，其次使用电表服务端属性 `declaredDemandKw`，最后使用 `POWER_DECLARED_DEMAND_KW`。异常持续时间按聚合时间桶累计，遇到数据断档会中断连续时长，LLM 不参与数值和阈值判断。
-
-直接调用综合电力分析 API：
-
-```json
-POST /api/v1/power-analysis
-{
-  "message": "分析15分钟需量、电压偏差和THD异常",
-  "device_scope": ["ThingsBoard-meter-device-uuid"],
-  "interval_seconds": 60,
-  "declared_demand_kw": 100,
-  "capabilities": ["demand_15m", "declared_demand_exceedance", "voltage_deviation", "thd"]
-}
-```
-
-生产对话会先由 Supervisor 路由至 `power`，再由服务端白名单选择工具。十三个工具共享一次构建的 `PowerSystemContext`，底层数据源凭据和原始时序不会进入 LLM 上下文；前端通过 SSE 只显示本次实际完成的工具。
-
-## Pydantic 数据契约
-
-项目采用“外部数据源投影 → 统一工业数据模型 → 领域上下文 → 确定性结果 → API DTO”的分层契约。`StrictModel` 默认设置 `extra="forbid"` 和赋值校验；Qwen Supervisor 的问题模式、业务领域、专业意图、主题和数据需求通过 `SemanticRouteOutput` 校验，数据源适配器把设备、时序、属性和告警收敛为统一模型，空压和电力分析输出使用明确的指标、告警、建议和上下文模型。控制命令使用方法与参数配对模型，例如 `setPowerLimit` 只能接收 `{ "value": number }`，`start/stop` 只能接收空参数。
-
-SQLAlchemy 继续负责数据库映射，不与 Pydantic 混用；JSON 列写入前使用严格模型序列化，读取 API 时使用 `from_attributes=True` 的 DTO。数学运算中的局部字典、LangGraph 节点更新映射和 HTTP 客户端参数不是业务数据契约，可以保留普通容器。
-
-查看自动生成的 JSON Schema：
-
-```powershell
-Invoke-RestMethod http://localhost:18089/openapi.json
-```
-
-创建待审批控制计划：
-
-```powershell
-$body = @{
-  device_id = "ThingsBoard-device-uuid"
-  device_name = "Arthra-EMS-01"
-  device_type = "ems"
-  method = "setPowerLimit"
-  params = @{ value = 300 }
-  reason = "需量控制建议"
-  risk_level = "medium"
-} | ConvertTo-Json
-Invoke-RestMethod -Method Post http://localhost:18089/api/v1/control-plans `
-  -Headers $headers -ContentType application/json -Body $body
-```
-
-只有 `admin` 或 `approver` 能调用 `/control-plans/{id}/approve`。批准时系统会再次校验设备类型、方法、参数范围和有效期，之后才发送 RPC。
+API 路由主要在 `apps/api/arthra/api.py`，Gateway 工厂在 `apps/arthra-gateway/src/arthra_gateway/app.py`。第三方界面集成时应以 `/openapi.json` 为契约，并保留 JWT、租户、工厂和角色权限。
 
 ## 本地开发和测试
 
 ```powershell
-$env:UV_CACHE_DIR='D:\aiagent\.uv-cache'
-$env:UV_PYTHON_INSTALL_DIR='D:\aiagent\.uv-python'
 uv sync --dev
 uv run alembic -c apps/api/alembic.ini upgrade head
 uv run uvicorn arthra.main:app --app-dir apps/api --reload
@@ -492,6 +208,8 @@ uv run ruff check apps services tests
 pnpm --dir apps/web build
 ```
 
+改动后至少运行受影响模块测试；修改公共 API、控制状态机、迁移或前端类型时运行完整测试和前端构建。
+
 ## 安全边界
 
 - LLM 永远不能访问 ThingsBoard 凭据或原始 RPC 客户端。
@@ -501,152 +219,13 @@ pnpm --dir apps/web build
 - 演示密码和本地 JWT 密钥不适用于生产环境。
 - 自动闭环、多租户、SSO 和高可用不在当前 MVP 范围内。
 
-## 常见问题
+## 更多文档
 
-**ThingsBoard 长时间未就绪？** 首次启动会初始化内部 PostgreSQL。运行 `docker compose logs -f thingsboard`，等待 Web 服务监听 9090 后模拟器会自动重试。
-
-**设备列表为空？** 检查 `simulator` 日志。它会使用 Tenant 账号创建三台设备并通过设备 token 上报数据。
-
-**模拟器包含哪些真实点表字段？** 开山空压机使用 `air_comp_*` 点，包括供气压力、排气温度、主机电流、运行/加载、维护时长以及原生故障和维护位；ADL400 使用 `meter_*` 点，包括三相电压/电流/功率、功率因数、频率、不平衡度、电能、需量、总谐波和 3/5/7 次谐波。专家按这些 pointCode 做确定性分析，不再依赖旧的通用字段名。
-
-**批准后显示 failed？** 检查模拟器是否连接 1883 端口并订阅 RPC；失败会写入计划结果和审计记录，不会静默重试控制。
-
-**如何清空演示数据？** `docker compose down -v` 会删除本项目 Compose 卷中的 Arthra 与 ThingsBoard 数据，此操作不可恢复。
-
-## Codex 开发指令模板(通用)
-```
-# Task: [任务名称]
-
-## 目标
-实现：
-[一句话描述需求]
-
-## 修改范围
-
-允许修改：
-
-- agents/compressor-agent/
-- packages/tools/compressor/
-
-禁止修改：
-
-- agents/main-agent/
-- packages/rag/
-- 其他Agent
-
-
-## 实现要求
-
-- 使用现有 LangGraph 架构
-- 使用已有 Tool Registry
-- 使用 Pydantic Schema
-- 不新增框架
-- 不绕过已有接口
-- 不把业务逻辑写入 Prompt
-
-
-## 流程
-
-输入：
-
-用户请求
-
-↓
-
-Main Agent
-
-↓
-
-目标 Agent
-
-↓
-
-RAG / Tool
-
-↓
-
-结果输出
-
-
-## 测试
-
-新增：
-
-- 单元测试
-- 集成测试
-
-运行：
-
-pytest
-ruff check .
-mypy .
-
-## 验收标准：
-1. [功能标准]
-2. [测试标准]
-3. [文档标准]
-4. [兼容性标准]
-
-
-## 完成后输出
-
-1. 修改文件
-2. 实现说明
-3. 测试结果
-4. 风险
-```
-## Codex 开发指令模板(精简)
-```
-# Task
-
-目标：
-[我要实现什么]
-
-
-修改：
-
-允许：
-- xxx
-
-禁止：
-- xxx
-
-
-要求：
-
-- 遵循现有架构
-- 不影响其他Agent
-- 保持接口兼容
-- 增加测试
-
-
-验收：
-
-- 功能完成
-- 测试通过
-- 无额外模块修改
-
-
-完成后报告：
-修改文件 + 测试结果
-```
-
-## Codex代码审查提示词
-```
-请审查当前分支相对 main 的改动。
-
-重点检查：
-1. LangGraph 是否可能形成无限循环。
-2. State 字段是否定义清楚。
-3. Tool 是否有严格输入输出。
-4. 是否存在自由 SQL。
-5. 是否有设备控制绕过审批。
-6. RAG 是否会在证据不足时编造。
-7. 是否存在上下文无限增长。
-8. 是否正确处理超时和空结果。
-9. 测试是否只验证 mock，而没有验证真实逻辑。
-10. 是否引入破坏性兼容问题。
-
-先列出问题，按照严重程度排序。
-不要直接修改，直到问题清单完成。
-```
+- [Docs 目录索引](docs/README.md)
+- [本地运行手册](docs/operations/local-runbook.md)
+- [真实数据维护手册](docs/operations/real-data-maintenance.md)
+- [领域确定性工具说明](docs/tools/domain-analysis-tools.md)
+- [Codex 协作提示词](docs/agents/codex-prompts.md)
+- [目标架构](docs/architecture/target-architecture.md)
+- [RAG 与知识资产边界](docs/architecture/rag-knowledge-boundary.md)
+- [迁移运行手册](docs/operations/migration-runbook.md)

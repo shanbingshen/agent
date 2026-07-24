@@ -46,4 +46,4 @@ knowledge/raw/carbon/
 knowledge/raw/customer/
 ```
 
-Agent 只能检索自身 `config.yaml` 允许的知识域。客户私有知识必须与公共知识分开，并在入库、检索和引用组装时绑定 `tenant_id` 与 `factory_id`。向量数据使用外部存储，本地 Qdrant 开发片段位于 `deployments/docker/qdrant.yml`；当前兼容层继续使用已有 PostgreSQL + pgvector 表。
+Agent 只能检索自身 `config.yaml` 允许的知识域。客户私有知识必须与公共知识分开，并在入库、检索和引用组装时绑定 `tenant_id` 与 `factory_id`。当前运行时使用 Postgres 保存知识文档、分片正文和权限元数据，使用 Milvus 保存 chunk 向量、租户/工厂过滤字段和向量索引；后续替换向量库时只修改 `packages/rag/src/arthra_rag/vectorstore/` 内部实现。

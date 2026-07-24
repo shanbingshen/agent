@@ -44,7 +44,7 @@ packages/rag/src/arthra_rag/
 
 ## 调用规则
 
-Agent 不直接读取 `knowledge`，也不直接访问 Qdrant 或 pgvector。Agent 通过 `arthra_rag.retrieve(...)` 或 Orchestrator 提供的 RAG Tool 检索知识。
+Agent 不直接读取 `knowledge`，也不直接访问 Milvus。Agent 通过 `arthra_rag.retrieve(...)` 或 Orchestrator 提供的 RAG Tool 检索知识。
 
 每个 Agent 通过 `config.yaml` 绑定知识域：
 
@@ -74,4 +74,4 @@ citations = retrieve(
 )
 ```
 
-当前实现仍兼容已有 PostgreSQL + pgvector 表。`knowledge_sources`、`device` 和 `model` 已进入稳定契约，后续新增 Qdrant 或元数据过滤时只修改 `packages/rag` 内部实现。
+当前实现使用 Postgres 保存知识文档、分片正文、租户/工厂权限和列表元数据，使用 Milvus 保存 chunk 向量、过滤字段和向量索引。`knowledge_sources`、`device` 和 `model` 已进入稳定契约，后续替换向量库或调整元数据过滤时只修改 `packages/rag` 内部实现。
