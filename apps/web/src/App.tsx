@@ -7,9 +7,9 @@ import {
   type ContextTimeScope,
   type CustomerAnswerMeta,
   type DailySummary,
+  type DemandForecastResponse,
   type Device,
   type Factory,
-  type LoadForecastMockResponse,
   type PowerAnalysisResult,
   sendChatFeedback,
   streamChat,
@@ -73,26 +73,6 @@ type ChartData = {
   labels: string[];
   unit: string;
   series: ChartSeries[];
-};
-
-const DEFAULT_LOAD_FORECAST: LoadForecastMockResponse = {
-  unit: "MW",
-  source: "mock",
-  model_name: "mock-deep-learning-placeholder",
-  confidence: 0.92,
-  peak_prediction_mw: 8.92,
-  risk_window: "14:30-16:00",
-  points: [
-    { label: "00:00", actual_mw: 2.1, ai_prediction_mw: 2.0, baseline_mw: 2.3, limit_mw: 8.6 },
-    { label: "04:00", actual_mw: 2.4, ai_prediction_mw: 2.7, baseline_mw: 2.5, limit_mw: 8.6 },
-    { label: "08:00", actual_mw: 4.8, ai_prediction_mw: 5.1, baseline_mw: 4.2, limit_mw: 8.6 },
-    { label: "12:00", actual_mw: 6.2, ai_prediction_mw: 6.8, baseline_mw: 5.5, limit_mw: 8.6 },
-    { label: "14:00", actual_mw: 7.9, ai_prediction_mw: 8.7, baseline_mw: 7.2, limit_mw: 8.6 },
-    { label: "16:00", actual_mw: null, ai_prediction_mw: 8.92, baseline_mw: 7.8, limit_mw: 8.6 },
-    { label: "18:00", actual_mw: null, ai_prediction_mw: 7.1, baseline_mw: 6.2, limit_mw: 8.6 },
-    { label: "20:00", actual_mw: null, ai_prediction_mw: 4.4, baseline_mw: 3.8, limit_mw: 8.6 },
-    { label: "24:00", actual_mw: null, ai_prediction_mw: 1.6, baseline_mw: 1.9, limit_mw: 8.6 },
-  ],
 };
 
 const ASSISTANT_THREAD_KEY = "arthra_assistant_thread_id";
@@ -216,14 +196,6 @@ function stateOf(payload: TelemetryPayload | undefined, key: string): string | u
   return String(latest.value);
 }
 
-function seriesOf(payload: TelemetryPayload | undefined, key: string): number[] {
-  return (payload?.[key] || [])
-    .slice()
-    .sort((a, b) => a.ts - b.ts)
-    .map(sample => typeof sample.value === "number" ? sample.value : Number(sample.value))
-    .filter(value => Number.isFinite(value));
-}
-
 function samplesOf(payload: TelemetryPayload | undefined, key: string): Array<{ ts: number; value: number }> {
   return (payload?.[key] || [])
     .map(sample => ({ ts: sample.ts, value: typeof sample.value === "number" ? sample.value : Number(sample.value) }))
@@ -243,6 +215,111 @@ function counterCurve(
   return samples
     .map(sample => ({ ts: sample.ts, value: Math.max(0, sample.value - baseline) }))
     .filter((sample, index, rows) => index === 0 || sample.value >= rows[index - 1].value);
+}
+
+type DemandProjection = {
+  labels: string[];
+  actual: Array<number | null>;
+  forecast: Array<number | null>;
+  lower: Array<number | null>;
+  upper: Array<number | null>;
+  currentDemandKw?: number;
+  predictedMaxKw?: number;
+  currentSlot: number;
+  peakTime?: string;
+  methodLabel: string;
+  dataBasis: string;
+  qualityGrade: "高" | "中高" | "中" | "低" | "计算中";
+  validationMaeKw?: number;
+};
+
+function buildDemandProjection(payload: TelemetryPayload | undefined): DemandProjection {
+  const now = new Date();
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  const yesterdayStart = new Date(todayStart);
+  yesterdayStart.setDate(yesterdayStart.getDate() - 1);
+  const todayStartTs = todayStart.getTime();
+  const yesterdayStartTs = yesterdayStart.getTime();
+  const nowTs = now.getTime();
+  const samples = samplesOf(payload, "meter_TotW");
+  const buckets = new Map<number, { total: number; count: number }>();
+  for (const sample of samples) {
+    const date = new Date(sample.ts);
+    const dayOffset = sample.ts >= todayStartTs && sample.ts <= nowTs
+      ? 96
+      : sample.ts >= yesterdayStartTs && sample.ts < todayStartTs
+        ? 0
+        : -96;
+    if (dayOffset < 0) continue;
+    const slot = dayOffset + date.getHours() * 4 + Math.floor(date.getMinutes() / 15);
+    const current = buckets.get(slot) || { total: 0, count: 0 };
+    current.total += sample.value;
+    current.count += 1;
+    buckets.set(slot, current);
+  }
+  const valueAt = (slot: number) => {
+    const bucket = buckets.get(slot);
+    return bucket ? bucket.total / bucket.count : undefined;
+  };
+  const labels = Array.from({ length: 96 }, (_, slot) => {
+    const hours = Math.floor(slot / 4).toString().padStart(2, "0");
+    const minutes = (slot % 4 * 15).toString().padStart(2, "0");
+    return `${hours}:${minutes}`;
+  });
+  const wallClockSlot = Math.min(95, now.getHours() * 4 + Math.floor(now.getMinutes() / 15));
+  const actual = labels.map((_, slot) => slot <= wallClockSlot ? valueAt(96 + slot) ?? null : null);
+  const latestActualSlot = actual.reduce<number>(
+    (latest, value, index) => typeof value === "number" ? index : latest,
+    -1,
+  );
+  const currentSlot = latestActualSlot >= 0 ? latestActualSlot : wallClockSlot;
+  const currentDemandKw = [...actual].reverse().find((value): value is number => typeof value === "number") ?? undefined;
+  const yesterdayComparable = valueAt(currentSlot);
+  const correction = currentDemandKw != null && yesterdayComparable
+    ? Math.max(0.75, Math.min(1.25, currentDemandKw / yesterdayComparable))
+    : 1;
+  const forecast = labels.map((_, slot) => {
+    if (slot < currentSlot) return null;
+    if (slot === currentSlot && currentDemandKw != null) return currentDemandKw;
+    const yesterdayValue = valueAt(slot);
+    if (yesterdayValue != null) return yesterdayValue * correction;
+    return currentDemandKw ?? null;
+  });
+  const predictedValues = forecast.filter((value): value is number => typeof value === "number");
+  const matchedFutureSlots = labels.slice(currentSlot + 1).filter((_, index) => valueAt(currentSlot + 1 + index) != null).length;
+  const futureSlots = Math.max(1, 95 - currentSlot);
+  return {
+    labels,
+    actual,
+    forecast,
+    lower: labels.map(() => null),
+    upper: labels.map(() => null),
+    currentDemandKw,
+    predictedMaxKw: predictedValues.length ? Math.max(...predictedValues) : undefined,
+    currentSlot,
+    methodLabel: "短时基线预测",
+    dataBasis: "昨日曲线校正",
+    qualityGrade: matchedFutureSlots / futureSlots >= 0.8 ? "中" : "计算中",
+  };
+}
+
+function machineDemandProjection(forecast: DemandForecastResponse): DemandProjection {
+  return {
+    labels: forecast.points.map(point => point.label),
+    actual: forecast.points.map(point => point.actual_kw),
+    forecast: forecast.points.map(point => point.prediction_kw),
+    lower: forecast.points.map(point => point.lower_kw),
+    upper: forecast.points.map(point => point.upper_kw),
+    currentDemandKw: forecast.current_demand_kw,
+    predictedMaxKw: forecast.peak_prediction_kw,
+    currentSlot: forecast.current_slot,
+    peakTime: forecast.peak_time,
+    methodLabel: forecast.method_label,
+    dataBasis: forecast.data_basis,
+    qualityGrade: forecast.quality_grade,
+    validationMaeKw: forecast.validation_mae_kw,
+  };
 }
 
 function format(value: number | undefined | null, digits = 1): string {
@@ -312,7 +389,7 @@ function useOperationsData(token: string, factoryId: string) {
   const [summaries, setSummaries] = useState<DailySummary[]>([]);
   const [powerAnalysis, setPowerAnalysis] = useState<PowerAnalysisResult | null>(null);
   const [compressorAnalysis, setCompressorAnalysis] = useState<CompressorAnalysisResult | null>(null);
-  const [loadForecast, setLoadForecast] = useState<LoadForecastMockResponse>(DEFAULT_LOAD_FORECAST);
+  const [demandForecast, setDemandForecast] = useState<DemandForecastResponse | null>(null);
   const [loading, setLoading] = useState(Boolean(token && factoryId));
   const [summaryBusy, setSummaryBusy] = useState(false);
   const [error, setError] = useState("");
@@ -321,11 +398,12 @@ function useOperationsData(token: string, factoryId: string) {
     if (!token || !factoryId) {
       setDevices([]); setSnapshots([]); setSummaries([]);
       setPowerAnalysis(null); setCompressorAnalysis(null);
-      setLoadForecast(DEFAULT_LOAD_FORECAST);
+      setDemandForecast(null);
       setLoading(false);
       return;
     }
     const factoryQuery = `factory_id=${encodeURIComponent(factoryId)}`;
+    setDemandForecast(null);
     let active = true;
     async function load() {
       setLoading(true); setError("");
@@ -371,14 +449,16 @@ function useOperationsData(token: string, factoryId: string) {
           return { device, telemetry, history, insightHistory, monthHistory, alarms: alarmPage.data || [] };
         }));
         const recentSummaries = await api<DailySummary[]>(`/daily-summaries?limit=7&${factoryQuery}`, token).catch(() => []);
-        const forecast = await api<LoadForecastMockResponse>("/load-forecast/mock", token).catch(() => DEFAULT_LOAD_FORECAST);
         if (!active) return;
         setSnapshots(rows); setSummaries(recentSummaries);
-        setLoadForecast(forecast);
 
         const meter = relevant.find(device => device.type === "meter");
         const compressor = relevant.find(device => device.type === "compressor");
         if (meter) {
+          void api<DemandForecastResponse>(
+            `/demand-forecast?device_id=${encodeURIComponent(meter.id.id)}&${factoryQuery}`,
+            token,
+          ).then(result => active && setDemandForecast(result)).catch(() => active && setDemandForecast(null));
           void api<PowerAnalysisResult>(`/power-analysis?${factoryQuery}`, token, {
             method: "POST",
             body: JSON.stringify({
@@ -427,7 +507,7 @@ function useOperationsData(token: string, factoryId: string) {
     }
   }
 
-  return { devices, snapshots, summaries, powerAnalysis, compressorAnalysis, loadForecast, loading, error, summaryBusy, refreshSummary };
+  return { devices, snapshots, summaries, powerAnalysis, compressorAnalysis, demandForecast, loading, error, summaryBusy, refreshSummary };
 }
 
 function chartValues(series: ChartSeries[]): number[] {
@@ -459,6 +539,15 @@ function linePath(values: Array<number | null | undefined>, min: number, max: nu
   return d;
 }
 
+function lineAreaPath(values: Array<number | null | undefined>, min: number, max: number, width: number, height: number): string {
+  const path = linePath(values, min, max, width, height);
+  const validIndexes = values.flatMap((value, index) => typeof value === "number" && Number.isFinite(value) ? [index] : []);
+  if (!path || !validIndexes.length) return "";
+  const firstX = validIndexes[0] / Math.max(1, values.length - 1) * width;
+  const lastX = validIndexes.at(-1)! / Math.max(1, values.length - 1) * width;
+  return `${path} L${lastX.toFixed(1)} ${(height - 14).toFixed(1)} L${firstX.toFixed(1)} ${(height - 14).toFixed(1)} Z`;
+}
+
 function InteractiveTooltip({ data, index, x, y, alignRight = false }: { data: ChartData; index: number; x: number; y: number; alignRight?: boolean }) {
   return <div className={`chart-tooltip ${alignRight ? "right" : ""}`} style={{ left: x, top: y }}>
     <strong>{data.labels[index]}</strong>
@@ -487,40 +576,86 @@ function Bars({ values, unit = "kW", labels }: { values: number[]; unit?: string
   </div>;
 }
 
-function ForecastLineChart({ forecast }: { forecast: LoadForecastMockResponse }) {
+function ForecastLineChart({ forecast, limitKw }: { forecast: DemandForecastResponse | null; limitKw?: number }) {
   const [hover, setHover] = useState<{ index: number; x: number; right: boolean } | null>(null);
+  if (!forecast?.points.length) return <div className="chart-empty">AI负荷预测计算中</div>;
+  const actualSeries: ChartSeries = { name: "实际负荷", values: forecast.points.map(point => point.actual_kw), color: "#6488ed", width: 3 };
+  const forecastSeries: ChartSeries = { name: "AI预测", values: forecast.points.map(point => point.prediction_kw), color: "#19e4c3", dashed: true, width: 2.8 };
+  const limitSeries: ChartSeries = { name: "限值阈值", values: forecast.points.map(() => limitKw), color: "#91a0a5", dashed: true, width: 1.8 };
+  const lower = forecast.points.map(point => point.lower_kw);
+  const upper = forecast.points.map(point => point.upper_kw);
   const data: ChartData = {
     labels: forecast.points.map(point => point.label),
-    unit: forecast.unit,
-    series: [
-      { name: "实际", values: forecast.points.map(point => point.actual_mw), color: "#16d7e8", width: 2.6 },
-      { name: "AI预测", values: forecast.points.map(point => point.ai_prediction_mw), color: "#e3fbff", dashed: true, width: 2.2 },
-      { name: "基线", values: forecast.points.map(point => point.baseline_mw), color: "#8b9da0", dashed: true, width: 2 },
-      { name: "限值", values: forecast.points.map(point => point.limit_mw), color: "#efb938", width: 2.4 },
-    ],
+    unit: "kW",
+    series: [actualSeries, forecastSeries, limitSeries],
   };
-  const values = chartValues(data.series);
-  const min = Math.min(...values, 0);
-  const max = Math.max(...values, 1);
-  const width = 600;
-  const height = 180;
-  function pointY(value: number) {
-    return 14 + (1 - (value - min) / (max - min || 1)) * (height - 28);
-  }
-  return <div className="forecast-chart interactive-chart" onMouseLeave={() => setHover(null)} onMouseMove={event => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    const x = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
-    const index = Math.max(0, Math.min(data.labels.length - 1, Math.round(x / rect.width * (data.labels.length - 1))));
-    setHover({ index, x: data.labels.length <= 1 ? 0 : index / (data.labels.length - 1) * rect.width, right: index > data.labels.length * 0.65 });
-  }}>
-    <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label="AI负荷预测曲线">
-      {data.series.map(series => <path key={series.name} d={linePath(series.values, min, max, width, height)} fill="none" stroke={series.color} strokeWidth={series.width || 2} strokeDasharray={series.dashed ? "8 6" : undefined} />)}
-    </svg>
-    {hover && <><span className="chart-guide" style={{ left: hover.x }} />{data.series.map(series => {
-      const value = series.values[hover.index];
-      if (typeof value !== "number" || !Number.isFinite(value)) return null;
-      return <span key={series.name} className="chart-dot" style={{ left: hover.x, top: pointY(value), background: series.color, boxShadow: `0 0 9px ${series.color}` }} />;
-    })}<InteractiveTooltip data={data} index={hover.index} x={hover.x} y={10} alignRight={hover.right} /></>}
+  const values = chartValues([
+    ...data.series,
+    { name: "预测下界", values: lower, color: "" },
+    { name: "预测上界", values: upper, color: "" },
+  ]);
+  const rawMin = Math.min(...values);
+  const rawMax = Math.max(...values);
+  const roughStep = Math.max(1, (rawMax - rawMin) / 4);
+  const magnitude = 10 ** Math.floor(Math.log10(roughStep));
+  const normalizedStep = roughStep / magnitude;
+  const step = (normalizedStep <= 1 ? 1 : normalizedStep <= 2 ? 2 : normalizedStep <= 5 ? 5 : 10) * magnitude;
+  const min = Math.max(0, Math.floor(rawMin / step) * step);
+  const max = Math.max(min + step * 4, Math.ceil(rawMax / step) * step);
+  const width = 900;
+  const height = 260;
+  const ticks = Array.from({ length: 5 }, (_, index) => max - index * (max - min) / 4);
+  const pointY = (value: number) => 14 + (1 - (value - min) / (max - min || 1)) * (height - 28);
+  const peakValue = forecast.peak_prediction_kw;
+  const peakIndex = forecast.points.findIndex(point => Math.abs(point.prediction_kw - peakValue) < 0.001);
+  const peakX = peakIndex < 0 ? 0 : peakIndex / Math.max(1, forecast.points.length - 1) * 100;
+  const currentX = forecast.current_slot / Math.max(1, forecast.points.length - 1) * 100;
+  const xLabels = Array.from({ length: 12 }, (_, index) => `${String(index * 2).padStart(2, "0")}:00`);
+  return <div className="forecast-chart">
+    <div className="overview-forecast-y-axis"><b>kW</b>{ticks.map(value => <span key={value}>{format(value, 0)}</span>)}</div>
+    <div className="overview-forecast-plot interactive-chart" onMouseLeave={() => setHover(null)} onMouseMove={event => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const x = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+      const index = Math.max(0, Math.min(data.labels.length - 1, Math.round(x / rect.width * (data.labels.length - 1))));
+      setHover({ index, x: data.labels.length <= 1 ? 0 : index / (data.labels.length - 1) * rect.width, right: index > data.labels.length * 0.65 });
+    }}>
+      <div className="overview-chart-legend">
+        <span className="actual"><i />实际负荷</span>
+        <span className="forecast"><i />AI预测</span>
+        <span className="range"><i />预测区间</span>
+        {limitKw != null && <span className="limit"><i />限值阈值</span>}
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label="AI负荷预测曲线">
+        {ticks.map(value => <line key={value} x1="0" x2={width} y1={pointY(value)} y2={pointY(value)} className="overview-forecast-grid" />)}
+        <path d={demandRangePath(lower, upper, min, max, width, height)} className="demand-range-area" />
+        <path d={linePath(lower, min, max, width, height)} className="demand-range-line" />
+        <path d={linePath(upper, min, max, width, height)} className="demand-range-line" />
+        {limitKw != null && <path d={linePath(limitSeries.values, min, max, width, height)} className="demand-target-line" />}
+        <path d={linePath(forecastSeries.values, min, max, width, height)} className="demand-ml-line" />
+        <path d={linePath(actualSeries.values, min, max, width, height)} className="demand-actual-line" />
+        {actualSeries.values.map((value, index) => typeof value === "number" && index % 4 === 0
+          ? <circle key={index} cx={index / 95 * width} cy={pointY(value)} r="3.7" className="demand-actual-point" />
+          : null)}
+      </svg>
+      <span className="overview-current-line" style={{ left: `${currentX}%` }}><b>当前</b></span>
+      {peakIndex >= 0 && <span className="demand-peak-label overview-peak-label" style={{ left: `${peakX}%`, top: 39 + pointY(peakValue) }}>
+        预计峰值 {format(peakValue, 0)} kW<i />
+      </span>}
+      <div className="overview-forecast-axis">{xLabels.map(label => <span key={label}>{label}</span>)}</div>
+      {hover && <><span className="chart-guide" style={{ left: hover.x }} />{data.series.map(series => {
+        const value = series.values[hover.index];
+        if (typeof value !== "number" || !Number.isFinite(value)) return null;
+        return <span key={series.name} className="chart-dot" style={{ left: hover.x, top: 39 + pointY(value), background: series.color }} />;
+      })}
+        <div className={`chart-tooltip overview-forecast-tooltip ${hover.right ? "right" : ""}`} style={{ left: hover.x, top: 152 }}>
+          <strong>{data.labels[hover.index]}</strong>
+          {typeof actualSeries.values[hover.index] === "number" && <span><i style={{ background: actualSeries.color }} />实际负荷<b>{format(actualSeries.values[hover.index], 1)} kW</b></span>}
+          <span><i style={{ background: forecastSeries.color }} />AI预测<b>{format(forecastSeries.values[hover.index], 1)} kW</b></span>
+          <span><i className="range-dot" />预测区间<b>{format(lower[hover.index], 1)}–{format(upper[hover.index], 1)} kW</b></span>
+          {limitKw != null && <span><i style={{ background: limitSeries.color }} />限值阈值<b>{format(limitKw, 1)} kW</b></span>}
+        </div>
+      </>}
+    </div>
   </div>;
 }
 
@@ -528,42 +663,153 @@ function DailyLineChart({ data }: { data: ChartData }) {
   const [hover, setHover] = useState<{ index: number; x: number; right: boolean } | null>(null);
   const values = chartValues(data.series);
   if (!values.length || !data.labels.length) return <div className="chart-empty daily-chart-empty">暂无可用日内曲线</div>;
-  const min = Math.min(...values, 0);
-  const max = Math.max(...values, 1);
-  const width = 300;
-  const height = 110;
+  const rawMax = Math.max(...values, 1);
+  const roughStep = Math.max(1, rawMax / 4);
+  const magnitude = 10 ** Math.floor(Math.log10(roughStep));
+  const normalizedStep = roughStep / magnitude;
+  const step = (normalizedStep <= 1 ? 1 : normalizedStep <= 2 ? 2 : normalizedStep <= 5 ? 5 : 10) * magnitude;
+  const min = 0;
+  const max = Math.max(step * 4, Math.ceil(rawMax / step) * step);
+  const width = 600;
+  const height = 128;
+  const ticks = Array.from({ length: 5 }, (_, index) => max - index * max / 4);
+  const xLabels = Array.from({ length: 13 }, (_, index) => String(index * 2).padStart(2, "0"));
   function pointY(value: number) {
     return 14 + (1 - (value - min) / (max - min || 1)) * (height - 28);
   }
-  return <div className="daily-spark interactive-chart" onMouseLeave={() => setHover(null)} onMouseMove={event => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    const relativeX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
-    const index = Math.max(0, Math.min(data.labels.length - 1, Math.round(relativeX / rect.width * (data.labels.length - 1))));
-    setHover({
-      index,
-      x: data.labels.length <= 1 ? 0 : index / (data.labels.length - 1) * rect.width,
-      right: index > data.labels.length * 0.55,
-    });
-  }}>
-    <div className="daily-chart-legend">{data.series.map(series =>
-      <span key={series.name}><i style={{ background: series.color }} />{series.name}</span>
-    )}</div>
-    <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label="时序数据日内累计能耗曲线">
-      {data.series.map(series => <path
-        key={series.name}
-        d={linePath(series.values, min, max, width, height)}
-        fill="none"
-        stroke={series.color}
-        strokeWidth={series.width || 2}
-        strokeDasharray={series.dashed ? "7 5" : undefined}
-      />)}
-    </svg>
-    <div className="daily-chart-x-axis"><span>{data.labels[0]}</span><span>{data.labels[Math.floor(data.labels.length / 2)]}</span><span>{data.labels.at(-1)}</span></div>
-    {hover && <><span className="chart-guide" style={{ left: hover.x }} />{data.series.map(series => {
-      const value = series.values[hover.index];
-      if (typeof value !== "number" || !Number.isFinite(value)) return null;
-      return <span key={series.name} className="chart-dot" style={{ left: hover.x, top: pointY(value), background: series.color }} />;
-    })}<InteractiveTooltip data={data} index={hover.index} x={hover.x} y={104} alignRight={hover.right} /></>}
+  return <div className="daily-energy-chart">
+    <div className="daily-chart-y-axis"><b>kWh</b>{ticks.map(value => <span key={value}>{format(value, 0)}</span>)}</div>
+    <div className="daily-spark interactive-chart" onMouseLeave={() => setHover(null)} onMouseMove={event => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const relativeX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+      const index = Math.max(0, Math.min(data.labels.length - 1, Math.round(relativeX / rect.width * (data.labels.length - 1))));
+      setHover({
+        index,
+        x: data.labels.length <= 1 ? 0 : index / (data.labels.length - 1) * rect.width,
+        right: index > data.labels.length * 0.55,
+      });
+    }}>
+      <div className="daily-chart-legend">{data.series.map(series =>
+        <span key={series.name}><i style={{ background: series.color }} />{series.name}</span>
+      )}</div>
+      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label="工厂日内累计能耗曲线，纵轴千瓦时，横轴每两小时">
+        {ticks.map(value => <line key={value} x1="0" x2={width} y1={pointY(value)} y2={pointY(value)} className="daily-grid-line" />)}
+        <path d={lineAreaPath(data.series[0].values, min, max, width, height)} className="daily-energy-area" />
+        {data.series.map(series => <path
+          key={series.name}
+          d={linePath(series.values, min, max, width, height)}
+          fill="none"
+          stroke={series.color}
+          strokeWidth={series.width || 2}
+          strokeDasharray={series.dashed ? "7 5" : undefined}
+          className="daily-energy-line"
+        />)}
+      </svg>
+      <div className="daily-chart-x-axis">{xLabels.map(label => <span key={label}>{label}</span>)}</div>
+      {hover && <><span className="chart-guide" style={{ left: hover.x }} />{data.series.map(series => {
+        const value = series.values[hover.index];
+        if (typeof value !== "number" || !Number.isFinite(value)) return null;
+        return <span key={series.name} className="chart-dot" style={{ left: hover.x, top: 18 + pointY(value), background: series.color }} />;
+      })}<InteractiveTooltip data={data} index={hover.index} x={hover.x} y={128} alignRight={hover.right} /></>}
+    </div>
+  </div>;
+}
+
+function demandRangePath(
+  lower: Array<number | null>,
+  upper: Array<number | null>,
+  min: number,
+  max: number,
+  width: number,
+  height: number,
+): string {
+  const point = (value: number, index: number) => {
+    const x = index / Math.max(1, lower.length - 1) * width;
+    const y = 14 + (1 - (value - min) / (max - min || 1)) * (height - 28);
+    return `${x.toFixed(1)} ${y.toFixed(1)}`;
+  };
+  const upperPoints = upper.flatMap((value, index) => typeof value === "number" ? [point(value, index)] : []);
+  const lowerPoints = lower.flatMap((value, index) => typeof value === "number" ? [point(value, index)] : []).reverse();
+  if (!upperPoints.length || upperPoints.length !== lowerPoints.length) return "";
+  return `M${upperPoints.join(" L")} L${lowerPoints.join(" L")} Z`;
+}
+
+function DemandForecastChart({ projection, controlTargetKw }: { projection: DemandProjection; controlTargetKw?: number }) {
+  const [hover, setHover] = useState<{ index: number; x: number; right: boolean } | null>(null);
+  const actualSeries: ChartSeries = { name: "实际需量", values: projection.actual, color: "#6488ed", width: 3 };
+  const forecastSeries: ChartSeries = { name: "AI预测", values: projection.forecast, color: "#19e4c3", dashed: true, width: 2.8 };
+  const targetSeries: ChartSeries = { name: "管控目标", values: projection.labels.map(() => controlTargetKw), color: "#91a0a5", dashed: true, width: 1.8 };
+  const telemetryValues = chartValues([actualSeries, forecastSeries]);
+  if (!telemetryValues.length) return <div className="chart-empty">暂无可用于需量预测的时序数据</div>;
+  const values = chartValues([actualSeries, forecastSeries, targetSeries, { name: "下界", values: projection.lower, color: "" }, { name: "上界", values: projection.upper, color: "" }]);
+  const rawMin = Math.min(...values);
+  const rawMax = Math.max(...values);
+  const roughStep = Math.max(1, (rawMax - rawMin) / 4);
+  const magnitude = 10 ** Math.floor(Math.log10(roughStep));
+  const normalizedStep = roughStep / magnitude;
+  const step = (normalizedStep <= 1 ? 1 : normalizedStep <= 2 ? 2 : normalizedStep <= 5 ? 5 : 10) * magnitude;
+  const min = Math.max(0, Math.floor(rawMin / step) * step);
+  const max = Math.max(min + step * 4, Math.ceil(rawMax / step) * step);
+  const width = 900;
+  const height = 300;
+  const pointY = (value: number) => 14 + (1 - (value - min) / (max - min || 1)) * (height - 28);
+  const ticks = Array.from({ length: 5 }, (_, index) => max - index * (max - min) / 4);
+  const peakValue = projection.predictedMaxKw;
+  const peakIndex = peakValue == null
+    ? -1
+    : projection.forecast.findIndex(value => typeof value === "number" && Math.abs(value - peakValue) < 0.001);
+  const peakX = peakIndex < 0 ? 0 : peakIndex / Math.max(1, projection.labels.length - 1) * 100;
+  const currentX = projection.currentSlot / Math.max(1, projection.labels.length - 1) * 100;
+  const xLabels = Array.from({ length: 12 }, (_, index) => `${String(index * 2).padStart(2, "0")}:00`);
+  const data: ChartData = { labels: projection.labels, unit: "kW", series: [actualSeries, forecastSeries, targetSeries] };
+  return <div className="demand-forecast-chart">
+    <div className="demand-y-axis"><b>kW</b>{ticks.map(value => <span key={value}>{format(value, 0)}</span>)}</div>
+    <div className="demand-chart-plot interactive-chart" onMouseLeave={() => setHover(null)} onMouseMove={event => {
+      const rect = event.currentTarget.getBoundingClientRect();
+      const relativeX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+      const index = Math.max(0, Math.min(data.labels.length - 1, Math.round(relativeX / rect.width * (data.labels.length - 1))));
+      setHover({
+        index,
+        x: data.labels.length <= 1 ? 0 : index / (data.labels.length - 1) * rect.width,
+        right: index > data.labels.length * 0.7,
+      });
+    }}>
+      <div className="demand-chart-legend">
+        <span className="actual"><i />实际需量</span>
+        <span className="forecast"><i />AI预测</span>
+        <span className="range"><i />预测区间</span>
+      </div>
+      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label="15分钟需量AI预测与管控曲线">
+        {ticks.map(value => <line key={value} x1="0" x2={width} y1={pointY(value)} y2={pointY(value)} className="demand-grid-line" />)}
+        <path d={demandRangePath(projection.lower, projection.upper, min, max, width, height)} className="demand-range-area" />
+        <path d={linePath(projection.lower, min, max, width, height)} className="demand-range-line" />
+        <path d={linePath(projection.upper, min, max, width, height)} className="demand-range-line" />
+        <path d={linePath(targetSeries.values, min, max, width, height)} className="demand-target-line" />
+        <path d={linePath(forecastSeries.values, min, max, width, height)} className="demand-ml-line" />
+        <path d={linePath(actualSeries.values, min, max, width, height)} className="demand-actual-line" />
+        {projection.actual.map((value, index) => typeof value === "number" && index % 4 === 0
+          ? <circle key={index} cx={index / 95 * width} cy={pointY(value)} r="3.7" className="demand-actual-point" />
+          : null)}
+      </svg>
+      <span className="demand-current-line" style={{ left: `${currentX}%` }}><b>当前</b></span>
+      {peakIndex >= 0 && peakValue != null && <span className="demand-peak-label" style={{ left: `${peakX}%`, top: 39 + pointY(peakValue) }}>
+        预计峰值 {format(peakValue, 0)} kW<i />
+      </span>}
+      <div className="demand-chart-axis">{xLabels.map(label => <span key={label}>{label}</span>)}</div>
+      {hover && <><span className="chart-guide" style={{ left: hover.x }} />{data.series.map(series => {
+        const value = series.values[hover.index];
+        if (typeof value !== "number" || !Number.isFinite(value)) return null;
+        return <span key={series.name} className="chart-dot" style={{ left: hover.x, top: 39 + pointY(value), background: series.color }} />;
+      })}
+        <div className={`chart-tooltip demand-tooltip ${hover.right ? "right" : ""}`} style={{ left: hover.x, top: 142 }}>
+          <strong>{data.labels[hover.index]}</strong>
+          {typeof projection.actual[hover.index] === "number" && <span><i style={{ background: actualSeries.color }} />实际需量<b>{format(projection.actual[hover.index], 1)} kW</b></span>}
+          <span><i style={{ background: forecastSeries.color }} />AI预测<b>{format(projection.forecast[hover.index], 1)} kW</b></span>
+          {typeof projection.lower[hover.index] === "number" && <span><i className="range-dot" />预测区间<b>{format(projection.lower[hover.index], 1)}–{format(projection.upper[hover.index], 1)} kW</b></span>}
+          {controlTargetKw != null && <span><i style={{ background: targetSeries.color }} />管控目标<b>{format(controlTargetKw, 1)} kW</b></span>}
+        </div>
+      </>}
+    </div>
   </div>;
 }
 
@@ -719,23 +965,47 @@ function InsightRail({
   const energyChangePct = todayEnergyKwh != null && yesterdayEnergyKwh
     ? (todayEnergyKwh - yesterdayEnergyKwh) / yesterdayEnergyKwh * 100
     : undefined;
-  const primaryTodayCurve = todayEnergyCurves[0]?.points || [];
-  const primaryYesterdayCurve = yesterdayEnergyCurves[0]?.points || [];
-  function alignCurve(points: Array<{ value: number }>, targetLength: number): number[] {
-    if (!points.length || !targetLength) return [];
-    return Array.from({ length: targetLength }, (_, index) => {
-      const sourceIndex = targetLength <= 1 ? 0 : Math.round(index / (targetLength - 1) * (points.length - 1));
-      return points[sourceIndex].value;
-    });
+  function aggregateEnergyCurves(
+    curves: Array<{ points: Array<{ ts: number; value: number }> }>,
+    dayStartTs: number,
+    visibleEndTs: number,
+  ): Array<number | null> {
+    const intervalMs = 5 * 60 * 1000;
+    const slotCount = 24 * 60 / 5;
+    const finalSlot = Math.max(0, Math.min(slotCount - 1, Math.floor((visibleEndTs - dayStartTs) / intervalMs)));
+    const totals = Array.from({ length: slotCount }, () => 0);
+    const coverage = Array.from({ length: slotCount }, () => 0);
+    for (const curve of curves) {
+      let pointIndex = 0;
+      let latestValue: number | undefined;
+      for (let slot = 0; slot <= finalSlot; slot += 1) {
+        const slotEndTs = dayStartTs + (slot + 1) * intervalMs - 1;
+        while (pointIndex < curve.points.length && curve.points[pointIndex].ts <= slotEndTs) {
+          latestValue = curve.points[pointIndex].value;
+          pointIndex += 1;
+        }
+        if (latestValue == null) continue;
+        totals[slot] += latestValue;
+        coverage[slot] += 1;
+      }
+    }
+    return totals.map((value, slot) => slot <= finalSlot && coverage[slot] > 0 ? value : null);
   }
-  const energyChart: ChartData | undefined = primaryTodayCurve.length > 1 ? {
-    labels: primaryTodayCurve.map(point => new Date(point.ts).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })),
+  const todayEnergyValues = aggregateEnergyCurves(todayEnergyCurves, todayStart.getTime(), now.getTime());
+  const yesterdayEnergyValues = aggregateEnergyCurves(yesterdayEnergyCurves, yesterdayStart.getTime(), todayStart.getTime() - 1);
+  const energyChartPointCount = todayEnergyValues.filter((value): value is number => typeof value === "number").length;
+  const energyLabels = Array.from({ length: 24 * 60 / 5 }, (_, slot) => {
+    const totalMinutes = slot * 5;
+    return `${String(Math.floor(totalMinutes / 60)).padStart(2, "0")}:${String(totalMinutes % 60).padStart(2, "0")}`;
+  });
+  const energyChart: ChartData | undefined = energyChartPointCount > 1 ? {
+    labels: energyLabels,
     unit: "kWh",
     series: [
-      { name: "今日累计", values: primaryTodayCurve.map(point => point.value), color: "#16d7e8", width: 2.5 },
-      ...(primaryYesterdayCurve.length > 1 ? [{
-        name: "昨日同期",
-        values: alignCurve(primaryYesterdayCurve, primaryTodayCurve.length),
+      { name: "今日", values: todayEnergyValues, color: "#20e6ef", width: 2.5 },
+      ...(yesterdayEnergyValues.some(value => typeof value === "number") ? [{
+        name: "昨日",
+        values: yesterdayEnergyValues,
         color: "#829798",
         dashed: true,
         width: 2,
@@ -794,7 +1064,7 @@ function InsightRail({
             unit: monthEnergyKwh != null ? "MWh" : undefined,
             confidence: confidencePct != null ? `${format(confidencePct, 0)}%` : "待评估",
           },
-          note: `累计电量计量点 · 5 分钟日内聚合 · ${primaryTodayCurve.length} 个有效点`,
+          note: `累计电量计量点 · 5 分钟日内聚合 · ${energyChartPointCount} 个有效点`,
         } },
       { id: "overview-energy-risk", icon: "!", tone: demandMargin != null && demandMargin < 0 ? "amber" : "cyan", title: "能量风险预警", badge: "负荷预测风险",
         summary: demandMargin == null ? "等待需量风险与 AI 负荷预测数据" : demandMargin < 0 ? `需量裕度为负 ${format(demandMargin)} kW` : `需量剩余裕度 ${format(demandMargin)} kW`,
@@ -948,7 +1218,7 @@ function InsightRail({
     if (workspace === "carbon") return { title: "AI 碳排洞察", statusLabel: "碳核算准备度", scoreLabel: "能源覆盖", insights: carbonInsights };
     if (workspace === "events") return { title: "AI 事件洞察", statusLabel: "事件数据状态", scoreLabel: "数据覆盖", insights: eventInsights };
     return { title: "AI 每日洞察", statusLabel: "工业数据覆盖", scoreLabel: "覆盖率", insights: overviewInsights };
-  }, [activeAlarms, anomalyItems, baseEvidence, compressorDevice, compressorPressure, compressorRealtime, compressorWarnings, confidencePct, coverage, dataTrust, demand, demandMargin, energyChangePct, energyChart, highAlarms, maxThdi, maxThdu, monthEnergyKwh, now, operationAdvice, overview, peakSpread, periodText, powerWarnings, primaryTodayCurve.length, savings, snapshots.length, summary?.warnings, todayEnergyKwh, warningCount, workspace]);
+  }, [activeAlarms, anomalyItems, baseEvidence, compressorDevice, compressorPressure, compressorRealtime, compressorWarnings, confidencePct, coverage, dataTrust, demand, demandMargin, energyChangePct, energyChart, energyChartPointCount, highAlarms, maxThdi, maxThdu, monthEnergyKwh, now, operationAdvice, overview, peakSpread, periodText, powerWarnings, savings, snapshots.length, summary?.warnings, todayEnergyKwh, warningCount, workspace]);
 
   useEffect(() => { setSelectedId(null); setEvidenceOpen(false); }, [workspace]);
   useEffect(() => {
@@ -992,7 +1262,7 @@ function MetricTile({ icon, label, value, unit, note, tone = "cyan" }: { icon: s
   return <article className={`metric-tile ${tone}`}><header><i>{icon}</i><span>{label}</span></header><strong>{value} <small>{unit}</small></strong><p>{note}</p></article>;
 }
 
-function Overview({ snapshots, powerAnalysis, compressorAnalysis, loadForecast }: { snapshots: DeviceSnapshot[]; powerAnalysis: PowerAnalysisResult | null; compressorAnalysis: CompressorAnalysisResult | null; loadForecast: LoadForecastMockResponse }) {
+function Overview({ snapshots, powerAnalysis, compressorAnalysis, loadForecast }: { snapshots: DeviceSnapshot[]; powerAnalysis: PowerAnalysisResult | null; compressorAnalysis: CompressorAnalysisResult | null; loadForecast: DemandForecastResponse | null }) {
   const meter = snapshots.find(row => row.device.type === "meter");
   const ems = snapshots.find(row => row.device.type === "ems");
   const compressor = snapshots.find(row => row.device.type === "compressor");
@@ -1001,12 +1271,28 @@ function Overview({ snapshots, powerAnalysis, compressorAnalysis, loadForecast }
   const energy = valueOf(meter?.telemetry, "meter_SupWh");
   const demand = latestRecord(powerAnalysis?.metrics?.demand);
   const realtime = latestRecord(compressorAnalysis?.metrics?.realtime);
+  const limitKw = demand?.declared_demand_kw ?? undefined;
+  const riskStart = loadForecast && limitKw != null
+    ? loadForecast.points.findIndex((point, index) => index >= loadForecast.current_slot && point.prediction_kw > limitKw)
+    : -1;
+  let riskEnd = riskStart;
+  if (loadForecast && limitKw != null && riskStart >= 0) {
+    while (riskEnd + 1 < loadForecast.points.length && loadForecast.points[riskEnd + 1].prediction_kw > limitKw) riskEnd += 1;
+  }
+  const riskWindow = limitKw == null
+    ? "限值未配置"
+    : riskStart < 0 || !loadForecast
+      ? "暂无"
+      : `${loadForecast.points[riskStart].label}-${riskEnd >= 95 ? "24:00" : loadForecast.points[riskEnd + 1].label}`;
   return <div className="overview-workspace">
     <EnergyMap meter={meter} ems={ems} compressor={compressor} />
-    <section className="trend-panel forecast-panel"><div className="section-head"><div><p>AI 预测</p><h3>AI负荷预测（MW）</h3></div><span>mock服务占位 · 后续接入深度学习预测工具</span></div>
-      <div className="forecast-legend"><span><i className="solid cyan" />实际</span><span><i className="dash light" />AI预测</span><span><i className="dash muted" />基线</span><span><i className="solid amber" />限值</span></div>
-      <ForecastLineChart forecast={loadForecast} />
-      <div className="forecast-stats"><span>今日峰值预测 <b>{format(loadForecast.peak_prediction_mw, 2)} MW</b></span><span>风险时段 <b>{loadForecast.risk_window}</b></span><span>置信度 <b>{format(loadForecast.confidence * 100, 0)}%</b></span></div>
+    <section className="trend-panel forecast-panel">
+      <div className="section-head overview-forecast-header">
+        <div><p>AI FORECAST</p><h3>今日AI负荷预测曲线</h3></div>
+        <span>模拟工况训练 · 实时时序校准 · 悬浮查看数值</span>
+      </div>
+      <ForecastLineChart forecast={loadForecast} limitKw={limitKw} />
+      <div className="forecast-stats"><span>今日峰值预测 <b>{format(loadForecast?.peak_prediction_kw)} <small>kW</small></b></span><span>风险时段 <b className={riskStart >= 0 ? "risk" : ""}>{riskWindow}</b></span><span>置信度 <b>{loadForecast?.quality_grade || "计算中"}</b></span></div>
     </section>
     <aside className="metric-rail">
       <MetricTile icon="∿" label="当前负荷" value={format(power)} unit="kW" note={demand?.max_demand_15m_kw != null ? `15分钟最大需量 ${format(demand.max_demand_15m_kw)} kW` : "需量计算中"} />
@@ -1023,14 +1309,76 @@ function InsightList({ title, warnings, empty }: { title: string; warnings?: Arr
   </section>;
 }
 
-function DemandWorkspace({ analysis, history, onAsk }: { analysis: PowerAnalysisResult | null; history: number[]; onAsk: (prompt: string) => void }) {
+function DemandWorkspace({ analysis, snapshot, forecast, onAsk }: { analysis: PowerAnalysisResult | null; snapshot?: DeviceSnapshot; forecast: DemandForecastResponse | null; onAsk: (prompt: string) => void }) {
   const metric = latestRecord(analysis?.metrics?.demand);
-  const margin = metric?.declared_demand_kw != null && metric.max_demand_15m_kw != null ? metric.declared_demand_kw - metric.max_demand_15m_kw : undefined;
+  const projection = useMemo(
+    () => forecast ? machineDemandProjection(forecast) : buildDemandProjection(snapshot?.insightHistory),
+    [forecast, snapshot?.insightHistory],
+  );
+  const currentDemandKw = projection.currentDemandKw ?? metric?.max_demand_15m_kw ?? undefined;
+  const predictedMaxKw = projection.predictedMaxKw ?? metric?.max_demand_15m_kw ?? undefined;
+  const declaredTargetKw = metric?.declared_demand_kw ?? undefined;
+  const suggestedTargetKw = declaredTargetKw != null
+    ? declaredTargetKw
+    : predictedMaxKw != null
+      ? Math.ceil(predictedMaxKw * 1.08 / 10) * 10
+      : undefined;
+  const [controlTargetKw, setControlTargetKw] = useState(suggestedTargetKw ?? 0);
+  useEffect(() => {
+    setControlTargetKw(suggestedTargetKw ?? 0);
+  }, [snapshot?.device.id, declaredTargetKw, forecast?.forecast_date]);
+  const targetAvailable = controlTargetKw > 0;
+  const margin = targetAvailable && predictedMaxKw != null ? controlTargetKw - predictedMaxKw : undefined;
+  const riskIndex = targetAvailable
+    ? projection.forecast.findIndex((value, index) => index >= projection.currentSlot && typeof value === "number" && value > controlTargetKw)
+    : -1;
+  const riskTime = riskIndex >= 0 ? projection.labels[riskIndex] : undefined;
+  const referenceKw = Math.max(currentDemandKw || 0, predictedMaxKw || 0, suggestedTargetKw || 0, 100);
+  const sliderStep = referenceKw < 100 ? 1 : 10;
+  const sliderMin = Math.max(sliderStep, Math.floor(referenceKw * 0.6 / sliderStep) * sliderStep);
+  const sliderMax = Math.max(sliderMin + sliderStep * 10, Math.ceil(referenceKw * 1.4 / sliderStep) * sliderStep);
+  const advicePrompt = [
+    "基于当前15分钟需量数据生成管控建议，只做预警和方案推演，不执行设备控制。",
+    `当前需量：${format(currentDemandKw)} kW`,
+    `预测最大需量：${format(predictedMaxKw)} kW`,
+    `管控目标：${targetAvailable ? format(controlTargetKw) : "未设置"} kW`,
+    `预测剩余裕度：${format(margin)} kW`,
+    `首个预计超限时刻：${riskTime || "未发现"}`,
+  ].join("；");
   return <div className="domain-workspace">
-    <div className="domain-main"><div className="domain-heading"><div><p>LOAD & DEMAND EXPERT</p><h2>15 分钟需量监测</h2></div><button onClick={() => onAsk("分析当前15分钟最大需量、峰均比和需量控制目标风险")}>询问需量专家</button></div>
-      <div className="domain-metrics"><MetricTile icon="D" label="15分钟最大需量" value={format(metric?.max_demand_15m_kw)} unit="kW" note="滚动平均确定性计算" /><MetricTile icon="↥" label="负荷峰值" value={format(metric?.instantaneous_peak_kw)} unit="kW" note="60秒桶峰值" /><MetricTile icon="÷" label="峰均比" value={format(metric?.peak_average_ratio, 3)} unit="" note={metric?.average_load_kw != null ? `平均负荷 ${format(metric.average_load_kw)} kW` : "等待历史数据"} tone="green" /><MetricTile icon="△" label="剩余需量裕度" value={format(margin)} unit="kW" note={margin == null ? "需量控制目标未配置" : margin >= 0 ? "尚未发生需量越限" : "已发生需量越限"} tone={margin != null && margin < 0 ? "amber" : "green"} /></div>
-      <section className="wide-chart"><div className="section-head"><div><p>实际功率</p><h3>24小时负荷证据</h3></div><span>实时功率不等于计费需量</span></div><Bars values={history} /></section>
-    </div><InsightList title="需量风险与建议" warnings={analysis?.warnings} empty="当前已执行的需量工具未产生越限提醒，建议保持监测。" />
+    <div className="domain-main demand-main"><div className="domain-heading"><div><p>LOAD & DEMAND EXPERT</p><h2>15分钟需量预测与管控</h2></div><button type="button" onClick={() => onAsk(advicePrompt)}>询问需量专家</button></div>
+      <section className="wide-chart demand-chart-panel"><div className="section-head"><div><p>AI FORECAST</p><h3>今日15分钟需量曲线</h3></div><span>{projection.dataBasis} · 悬浮查看数值</span></div><DemandForecastChart projection={projection} controlTargetKw={targetAvailable ? controlTargetKw : undefined} /><footer className="demand-model-meta"><span>{projection.methodLabel}</span><span>模型质量 <b>{projection.qualityGrade}</b></span><span>回测 MAE <b>{format(projection.validationMaeKw)} kW</b></span><span>预测峰值 <b>{projection.peakTime || "计算中"}</b></span></footer></section>
+      <div className="domain-metrics demand-metrics">
+        <MetricTile icon="D" label="当前15分钟需量" value={format(currentDemandKw)} unit="kW" note="时序功率按15分钟聚合" />
+        <MetricTile icon="↗" label="预测最大需量" value={format(predictedMaxKw)} unit="kW" note={projection.methodLabel} tone={riskTime ? "amber" : "cyan"} />
+        <MetricTile icon="◎" label="管控目标" value={targetAvailable ? format(controlTargetKw) : "—"} unit="kW" note="可在下方调整推演目标" tone="amber" />
+        <MetricTile icon="△" label="预测剩余裕度" value={format(margin)} unit="kW" note={margin == null ? "等待目标或预测数据" : margin >= 0 ? "预测峰值低于管控目标" : "预测存在超限风险"} tone={margin != null && margin < 0 ? "amber" : "green"} />
+      </div>
+      <section className="demand-control-panel">
+        <div className="demand-control-range">
+          <header><span>管控目标推演</span><strong>{targetAvailable ? format(controlTargetKw, 0) : "—"} <small>kW</small></strong></header>
+          <input
+            type="range"
+            min={sliderMin}
+            max={sliderMax}
+            step={sliderStep}
+            value={targetAvailable ? Math.max(sliderMin, Math.min(sliderMax, controlTargetKw)) : sliderMin}
+            aria-label="调整需量管控目标"
+            onChange={event => setControlTargetKw(Number(event.target.value))}
+          />
+          <div><span>{sliderMin} kW</span><span>{sliderMax} kW</span></div>
+        </div>
+        <div className={`demand-control-status ${riskTime ? "warning" : ""}`}>
+          <span>{riskTime ? "预计超限风险" : targetAvailable ? "预测处于目标内" : "管控目标待设置"}</span>
+          <strong>{riskTime ? `${riskTime} 起` : margin != null ? `裕度 ${format(margin)} kW` : "数据计算中"}</strong>
+          <small>模型质量 {projection.qualityGrade} · 每15分钟更新</small>
+        </div>
+        <div className="demand-control-action">
+          <button type="button" onClick={() => onAsk(advicePrompt)}>生成管控建议</button>
+          <p>仅用于预警与方案推演，不直接控制设备</p>
+        </div>
+      </section>
+    </div><InsightList title="需量风险与建议" warnings={analysis?.warnings} empty={riskTime ? `短时预测显示 ${riskTime} 起可能超过当前管控目标，请核查生产计划。` : "当前短时预测未发现需量越限，建议持续监测。"} />
   </div>;
 }
 
@@ -1398,7 +1746,6 @@ export default function App() {
   }, [token, factoryId]);
   useEffect(() => { const timer = window.setInterval(() => setClock(new Date()), 30_000); return () => window.clearInterval(timer); }, []);
   const meter = data.snapshots.find(row => row.device.type === "meter");
-  const history = seriesOf(meter?.history, "meter_TotW");
   const latestSummary = data.summaries[0];
   function ask(prompt: string) { setAssistantPrompt(prompt); setAssistantOpen(true); }
   function login(value: string) {
@@ -1427,8 +1774,8 @@ export default function App() {
       <InsightRail workspace={workspace} summary={latestSummary} snapshots={data.snapshots} powerAnalysis={data.powerAnalysis} compressorAnalysis={data.compressorAnalysis} summaryBusy={data.summaryBusy} onRefresh={data.refreshSummary} onAsk={ask} />
       <main className="main-stage">
         {data.loading && !data.snapshots.length && <div className="stage-loading"><i /><span>正在连接统一工业数据服务</span></div>}
-        {workspace === "overview" && <Overview snapshots={data.snapshots} powerAnalysis={data.powerAnalysis} compressorAnalysis={data.compressorAnalysis} loadForecast={data.loadForecast} />}
-        {workspace === "demand" && <DemandWorkspace analysis={data.powerAnalysis} history={history} onAsk={ask} />}
+        {workspace === "overview" && <Overview snapshots={data.snapshots} powerAnalysis={data.powerAnalysis} compressorAnalysis={data.compressorAnalysis} loadForecast={data.demandForecast} />}
+        {workspace === "demand" && <DemandWorkspace analysis={data.powerAnalysis} snapshot={meter} forecast={data.demandForecast} onAsk={ask} />}
         {workspace === "quality" && <QualityWorkspace analysis={data.powerAnalysis} onAsk={ask} />}
         {workspace === "compressor" && <CompressorWorkspace analysis={data.compressorAnalysis} onAsk={ask} />}
         {workspace === "carbon" && <CarbonWorkspace summary={latestSummary} onAsk={ask} />}

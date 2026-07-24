@@ -23,6 +23,7 @@ from arthra.contracts import Citation, JsonObject
 from arthra.control import ControlService
 from arthra.daily_summary import DailySummaryError, generate_daily_summary
 from arthra.db import get_db
+from arthra.demand_forecast import DemandForecastError, DemandForecastService
 from arthra.industrial_data import IndustrialDataError
 from arthra.industrial_data.factory import get_industrial_data_service
 from arthra.industrial_data.schemas import (
@@ -71,6 +72,7 @@ from arthra.schemas import (
     CustomerWarningView,
     DailySummaryCreate,
     DailySummaryRead,
+    DemandForecastResponse,
     FactoryAccessGrant,
     FactoryCreate,
     FactoryDeviceCreate,
@@ -1287,6 +1289,23 @@ def mock_load_forecast() -> LoadForecastMockResponse:
         risk_window="14:30-16:00",
         points=points,
     )
+
+
+@router.get("/demand-forecast", response_model=DemandForecastResponse, tags=["forecast"])
+def demand_forecast(
+    device_id: str = Query(min_length=1, max_length=128),
+    factory_id: uuid.UUID | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> DemandForecastResponse:
+    resolved_factory_id = _factory_scope(db, user, factory_id)
+    _authorized_scope(db, user, resolved_factory_id, [device_id])
+    try:
+        return DemandForecastService().forecast(device_id)
+    except DemandForecastError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except IndustrialDataError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.get("/health", include_in_schema=False)
