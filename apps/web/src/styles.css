@@ -90,12 +90,25 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 1px
 .daily-insight-shell.open .insight-card { border-bottom-color: #173037; }
 .daily-insight-body { display: grid; gap: 10px; color: #a8bbbd; font-size: 11px; line-height: 1.6; }
 .daily-insight-body p { margin: 0; color: #9fb1b3; }
-.daily-value { color: #9cadad; }
-.daily-value b { display: block; margin-top: 6px; color: var(--cyan); font-size: 21px; font-weight: 500; }
+.daily-panel-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-bottom: 3px; }
+.daily-panel-title strong { color: #dff8fb; font-size: 14px; font-weight: 500; }
+.daily-panel-title span { border: 1px solid #80691f; border-radius: 8px; color: #e6c85d; padding: 2px 9px; font-size: 9px; }
+.daily-value { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 10px; color: #9cadad; }
+.daily-value > span { display: grid; gap: 1px; }
+.daily-value > span small { color: #6f8588; font-size: 9px; }
+.daily-value > div { text-align: right; }
+.daily-value b { display: block; color: var(--cyan); font-size: 21px; font-weight: 500; line-height: 1.15; }
 .daily-value small, .daily-month small { color: #9cadad; font-size: 10px; font-weight: 400; }
-.daily-value em { float: right; color: var(--green); font-style: normal; font-size: 11px; }
-.daily-spark { height: 98px; border-left: 1px solid #28515a; border-bottom: 1px solid #28515a; background: repeating-linear-gradient(0deg, transparent 0 25px, #173139 26px); }
-.daily-spark svg { width: 100%; height: 100%; display: block; }
+.daily-value em { display: block; color: var(--green); font-style: normal; font-size: 9px; }
+.daily-value em.amber { color: var(--amber); }
+.daily-spark { height: 126px; margin-bottom: 14px; border-left: 1px solid #28515a; border-bottom: 1px solid #28515a; background: repeating-linear-gradient(0deg, transparent 0 27px, #173139 28px); }
+.daily-spark svg { width: 100%; height: calc(100% - 19px); margin-top: 15px; display: block; overflow: visible; }
+.daily-spark .chart-tooltip { min-width: 132px; }
+.daily-chart-legend { position: absolute; z-index: 3; top: 2px; right: 4px; display: flex; gap: 9px; color: #8da4a7; font-size: 8px; pointer-events: none; }
+.daily-chart-legend span { display: flex; align-items: center; gap: 4px; }
+.daily-chart-legend i { width: 7px; height: 7px; border-radius: 50%; }
+.daily-chart-x-axis { position: absolute; left: 5px; right: 5px; bottom: -16px; display: flex; justify-content: space-between; color: #61777b; font-size: 8px; pointer-events: none; }
+.daily-chart-empty { min-height: 70px; margin: 0; }
 .daily-month { color: #8da0a2; font-size: 10px; }
 .daily-month b { display: block; color: var(--cyan); font-size: 17px; font-weight: 500; }
 .daily-month span { display: block; margin-top: 3px; color: #72878a; font-size: 9px; }
@@ -107,6 +120,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 1px
 .daily-list li { min-height: 30px; padding: 7px 8px; border-left: 2px solid var(--cyan); background: #081b20; color: #aebfc0; font-size: 10px; }
 .daily-list.risk li:first-child { border-color: var(--amber); }
 .daily-list em { float: right; color: var(--amber); font-style: normal; }
+.daily-list em.green { color: var(--green); }
+.daily-summary-footer { display: flex; align-items: end; justify-content: space-between; gap: 8px; margin-top: 5px; padding-top: 8px; border-top: 1px solid #173037; }
+.daily-summary-footer > div:first-child { display: grid; color: #84999c; font-size: 9px; }
+.daily-summary-footer > div:first-child b { color: var(--cyan); font-size: 17px; font-weight: 500; }
+.daily-summary-footer small { color: #8ba0a2; font-size: 9px; font-weight: 400; }
+.daily-confidence { border: 1px solid #26444b; border-radius: 8px; background: #10262e; color: #8ea7aa; padding: 5px 7px; font-size: 8px; white-space: nowrap; }
+.daily-confidence strong { display: block; color: var(--green); font-weight: 500; }
+.daily-note { border-top: 1px solid #173037; padding-top: 7px; color: #71878a; font-size: 9px; line-height: 1.45; }
 @keyframes daily-drop { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
 
 .main-stage { min-width: 0; padding: 28px clamp(18px, 3vw, 46px) 25px; }

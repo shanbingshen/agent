@@ -4,6 +4,7 @@ import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
+from typing import Literal
 
 from arthra_rag import retrieve_citations
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
@@ -626,6 +627,9 @@ def telemetry(
     keys: str = "",
     start_ts: int | None = None,
     end_ts: int | None = None,
+    limit: int = Query(1000, ge=1, le=10_000),
+    agg: Literal["AVG", "MIN", "MAX", "SUM", "COUNT", "NONE"] = "NONE",
+    interval_ms: int | None = Query(default=None, ge=1_000),
     factory_id: uuid.UUID | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -636,7 +640,15 @@ def telemetry(
     parsed_keys = [key.strip() for key in keys.split(",") if key.strip()]
     try:
         if start_ts is not None and end_ts is not None:
-            return service.telemetry_history(device_id, parsed_keys, start_ts, end_ts)
+            return service.telemetry_history(
+                device_id,
+                parsed_keys,
+                start_ts,
+                end_ts,
+                limit=limit,
+                agg=agg,
+                interval=interval_ms,
+            )
         return service.latest_telemetry(device_id, parsed_keys or None)
     except IndustrialDataError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

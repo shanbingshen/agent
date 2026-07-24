@@ -2,7 +2,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $Root = if ($env:ARTHRA_ROOT) { $env:ARTHRA_ROOT } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-$LrPython = if ($env:LR_PY) { $env:LR_PY } else { Join-Path $env:USERPROFILE "miniforge3\envs\LR\python.exe" }
+$LrPython = if ($env:LR_PY) { $env:LR_PY } else { Join-Path $Root ".venv\Scripts\python.exe" }
 $Pnpm = if ($env:PNPM) { $env:PNPM } else { "pnpm" }
 $NodeBin = if ($env:NODE_BIN) { $env:NODE_BIN } else { "" }
 
@@ -11,6 +11,10 @@ $ApiPort = if ($env:API_PORT) { [int]$env:API_PORT } else { 18089 }
 $WebHost = if ($env:WEB_HOST) { $env:WEB_HOST } else { "127.0.0.1" }
 $WebPort = if ($env:WEB_PORT) { [int]$env:WEB_PORT } else { 18090 }
 $OpenBrowser = if ($env:OPEN_BROWSER) { $env:OPEN_BROWSER } else { "1" }
+$IndustrialDataProvider = if ($env:INDUSTRIAL_DATA_PROVIDER) { $env:INDUSTRIAL_DATA_PROVIDER } else { "mock" }
+$ThingsBoardUrl = if ($env:THINGSBOARD_URL) { $env:THINGSBOARD_URL } else { "http://127.0.0.1:9090" }
+$ThingsBoardUsername = if ($env:THINGSBOARD_USERNAME) { $env:THINGSBOARD_USERNAME } else { "tenant@thingsboard.org" }
+$ThingsBoardPassword = if ($env:THINGSBOARD_PASSWORD) { $env:THINGSBOARD_PASSWORD } else { "tenant" }
 $BrowserApiHost = if ($ApiHost -eq "0.0.0.0") { "localhost" } else { $ApiHost }
 $CorsOrigins = if ($env:CORS_ORIGINS) {
   $env:CORS_ORIGINS
@@ -129,12 +133,39 @@ function Test-FrontendToolchain {
   }
 }
 
+function Ensure-PythonEnvironment {
+  param([string]$ProjectRoot)
+  if (Test-Path -LiteralPath $LrPython) { return }
+  $Uv = Get-Command uv -ErrorAction SilentlyContinue
+  if ($null -eq $Uv) {
+    Fail "找不到项目 Python 环境。请安装 uv，或设置 LR_PY 指向可用的 python.exe"
+  }
+  Say-Step "未找到项目 Python 环境，正在执行 uv sync --dev"
+  $BundledPython = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+  $PythonCandidate = if ($env:UV_PYTHON) {
+    $env:UV_PYTHON
+  } elseif (Test-Path -LiteralPath $BundledPython) {
+    $BundledPython
+  } else {
+    $null
+  }
+  if ($PythonCandidate) {
+    & $Uv.Source sync --dev --project $ProjectRoot --python $PythonCandidate
+  } else {
+    & $Uv.Source sync --dev --project $ProjectRoot
+  }
+  if ($LASTEXITCODE -ne 0) {
+    Fail "uv sync --dev 执行失败"
+  }
+}
+
 try {
   Set-Location -LiteralPath $Root
   New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
   New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 
   Say-Step "检查 LR 环境和前端工具链"
+  Ensure-PythonEnvironment -ProjectRoot $Root
   $LrPython = Resolve-Executable -Candidate $LrPython -Name "LR Python"
   $Pnpm = Resolve-Executable -Candidate $Pnpm -Name "pnpm"
   if (-not [string]::IsNullOrWhiteSpace($NodeBin)) {
@@ -156,7 +187,11 @@ try {
 
   $WebNodeModules = Join-Path $Root "apps\web\node_modules"
   if (-not (Test-Path -LiteralPath $WebNodeModules)) {
-    Fail "前端依赖未安装。请先执行：pnpm --dir `"$Root\apps\web`" install"
+    Say-Step "未找到前端依赖，正在执行 pnpm install"
+    & $Pnpm --dir (Join-Path $Root "apps\web") install
+    if ($LASTEXITCODE -ne 0) {
+      Fail "pnpm install 执行失败"
+    }
   }
   $WebRoot = Join-Path $Root "apps\web"
   Test-FrontendToolchain -PnpmExe $Pnpm -NodeDirectory $NodeBin -WebRoot $WebRoot
@@ -192,7 +227,10 @@ try {
   Say-Step "初始化本地调试数据库：$DbFile"
   $env:DATABASE_URL = $DatabaseUrl
   $env:LANGGRAPH_DATABASE_URL = ""
-  $env:INDUSTRIAL_DATA_PROVIDER = "mock"
+  $env:INDUSTRIAL_DATA_PROVIDER = $IndustrialDataProvider
+  $env:THINGSBOARD_URL = $ThingsBoardUrl
+  $env:THINGSBOARD_USERNAME = $ThingsBoardUsername
+  $env:THINGSBOARD_PASSWORD = $ThingsBoardPassword
   $env:DAILY_SUMMARY_ENABLED = "false"
   $env:CORS_ORIGINS = $CorsOrigins
   $env:NO_PROXY = $NoProxy
@@ -204,11 +242,14 @@ try {
   }
 
   Say-Step "启动后端 API：http://${ApiHost}:$ApiPort"
-  $script:ApiJob = Start-Job -Name "arthra-api-lr" -ArgumentList $LrPython, $ApiHost, $ApiPort, $DatabaseUrl, $CorsOrigins, $NoProxy, $PythonPath, $ApiLog -ScriptBlock {
-    param($Python, $HostName, $Port, $DbUrl, $Cors, $NoProxyValue, $PyPath, $LogFile)
+  $script:ApiJob = Start-Job -Name "arthra-api-lr" -ArgumentList $LrPython, $ApiHost, $ApiPort, $DatabaseUrl, $CorsOrigins, $NoProxy, $PythonPath, $ApiLog, $IndustrialDataProvider, $ThingsBoardUrl, $ThingsBoardUsername, $ThingsBoardPassword -ScriptBlock {
+    param($Python, $HostName, $Port, $DbUrl, $Cors, $NoProxyValue, $PyPath, $LogFile, $DataProvider, $TbUrl, $TbUsername, $TbPassword)
     $env:DATABASE_URL = $DbUrl
     $env:LANGGRAPH_DATABASE_URL = ""
-    $env:INDUSTRIAL_DATA_PROVIDER = "mock"
+    $env:INDUSTRIAL_DATA_PROVIDER = $DataProvider
+    $env:THINGSBOARD_URL = $TbUrl
+    $env:THINGSBOARD_USERNAME = $TbUsername
+    $env:THINGSBOARD_PASSWORD = $TbPassword
     $env:DAILY_SUMMARY_ENABLED = "false"
     $env:SUPERVISOR_SEMANTIC_ROUTING_ENABLED = "false"
     $env:COMPRESSOR_EXPERT_LLM_ENABLED = "false"
@@ -243,7 +284,7 @@ try {
   Write-Host "账号：   admin@arthra.local"
   Write-Host "密码：   Arthra@123456"
   Write-Host ""
-  Write-Host "当前使用 mock 工业数据和 SQLite 临时库，不需要 Docker / ThingsBoard / PostgreSQL。"
+  Write-Host "当前工业数据源：$IndustrialDataProvider"
   Write-Host ""
   Write-Host "日志："
   Write-Host "- $ApiLog"

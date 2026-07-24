@@ -327,7 +327,7 @@ def deterministic_summary(title: str, snapshot: DailySnapshot) -> str:
         "## 运行概况",
         f"- 覆盖设备：{overview['available_device_count']} / {overview['device_count']} 台",
         f"- 确定性规则提醒：{overview['warning_count']} 条",
-        f"- ThingsBoard 告警：{overview['alarm_count']} 条",
+        f"- 数据源活动告警：{overview['alarm_count']} 条",
     ]
     if overview.get("average_active_power_kw") is not None:
         coverage = overview.get("active_power_data_coverage")
@@ -368,7 +368,7 @@ def _synthesize_with_llm(title: str, snapshot: DailySnapshot, settings: Settings
     prompt = "\n".join(
         [
             "你是 Arthra 能碳大脑的每日运营摘要专家。请使用中文 Markdown 输出简洁、专业、可执行的每日摘要。",
-            "只能使用下方确定性统计和 ThingsBoard 数据，严禁虚构历史趋势、节能量、告警或设备读数。",
+            "只能使用下方确定性统计和统一工业时序数据，严禁虚构历史趋势、节能量、告警或设备读数。",
             "结构必须包含：运行概况、能源与电能质量、空压机状态、风险提醒、今日建议。",
             "若数据缺失要明确说明；若建议涉及控制，只能建议创建待审批计划，不能声称已经执行。",
             "energy_consumption_kwh 是最近 24 小时查询窗口内已有数据的电量增量；不要声称数据一定完整覆盖 24 小时。",

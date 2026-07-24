@@ -767,7 +767,7 @@ def _render_knowledge_explanation(state: AgentState) -> str:
     system_prompt = "\n".join(
         [
             "你是 AethraVista 的工业能源知识解释助手。",
-            "只解释用户询问的概念，不查询或声称读取了当前设备、ThingsBoard、遥测或告警数据。",
+            "只解释用户询问的概念，不查询或声称读取了当前设备、遥测或告警数据。",
             "使用中文，先给定义，再说明常用单位或关键判断边界；控制在 2 至 4 句话。",
             "不要扩展成设备运行报告，不生成未经数据支持的当前值、异常结论或节能量。",
             "只输出符合下方 JSON Schema 的 JSON 对象，不要输出 Markdown。",

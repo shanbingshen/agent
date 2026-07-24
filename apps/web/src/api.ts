@@ -29,7 +29,9 @@ export type DailySummary = {
       warning_count: number;
       alarm_count: number;
       average_active_power_kw: number | null;
+      active_power_data_coverage?: number | null;
       energy_consumption_kwh: number | null;
+      energy_consumption_status?: "available" | "partial" | "unavailable" | "invalid";
     };
   };
   warnings: Array<{ severity?: string; device_name?: string; message?: string }>;
@@ -84,7 +86,7 @@ export type ChatFeedbackRequest = {
 
 export type TelemetrySample = {
   ts: number;
-  value: string | number | boolean;
+  value: string | number | boolean | null;
 };
 export type TelemetryPayload = Record<string, TelemetrySample[]>;
 
