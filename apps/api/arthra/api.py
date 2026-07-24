@@ -30,7 +30,13 @@ from arthra.industrial_data.schemas import (
     IndustrialDevicePage,
     IndustrialTelemetryHistory,
 )
-from arthra.knowledge import chunk_text, embed_texts, search_knowledge
+from arthra.knowledge import (
+    chunk_text,
+    delete_knowledge_vectors,
+    embed_texts,
+    search_knowledge,
+    upsert_knowledge_vectors,
+)
 from arthra.models import (
     AgentTrace,
     AuditEvent,
@@ -1106,8 +1112,17 @@ def upload_document(
     db.add(document)
     db.flush()
     vectors = embed_texts(parts)
-    for position, (part, vector) in enumerate(zip(parts, vectors, strict=True)):
-        db.add(KnowledgeChunk(document_id=document.id, position=position, content=part, embedding=vector))
+    chunks: list[KnowledgeChunk] = []
+    for position, part in enumerate(parts):
+        chunk = KnowledgeChunk(document_id=document.id, position=position, content=part)
+        db.add(chunk)
+        chunks.append(chunk)
+    db.flush()
+    try:
+        upsert_knowledge_vectors(document=document, chunks=chunks, embeddings=vectors)
+    except RuntimeError as exc:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     document.status = "ready"
     db.commit()
     return KnowledgeUploadResponse(
@@ -1145,6 +1160,10 @@ def delete_document(
     if document is None or document.tenant_id != user.tenant_id:
         raise HTTPException(status_code=404, detail="文档不存在")
     _factory_scope(db, user, document.factory_id)
+    try:
+        delete_knowledge_vectors(document.id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     db.delete(document)
     db.commit()
 
@@ -1157,15 +1176,16 @@ def knowledge_search(
     user: User = Depends(get_current_user),
 ):
     resolved_factory_id = _factory_scope(db, user, factory_id)
-    return KnowledgeSearchResponse(
-        query=q,
-        results=search_knowledge(
+    try:
+        results = search_knowledge(
             db,
             q,
             tenant_id=user.tenant_id,
             factory_id=resolved_factory_id,
-        ),
-    )
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return KnowledgeSearchResponse(query=q, results=results)
 
 
 @router.post("/control-plans", response_model=ControlPlanRead, tags=["control"])

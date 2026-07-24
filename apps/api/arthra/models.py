@@ -2,7 +2,6 @@ import uuid
 from datetime import UTC, date, datetime
 from enum import StrEnum
 
-from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
     Boolean,
@@ -241,4 +240,3 @@ class KnowledgeChunk(Base):
     document_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("knowledge_documents.id", ondelete="CASCADE"), index=True)
     position: Mapped[int]
     content: Mapped[str] = mapped_column(Text)
-    embedding: Mapped[list[float] | None] = mapped_column(Vector(384), nullable=True)

@@ -1,0 +1,1 @@
+"""Shared non-persistent models."""

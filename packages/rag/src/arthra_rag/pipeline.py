@@ -2,7 +2,7 @@
 
 The first migration milestone keeps persistence in the existing API layer. This
 module defines the pipeline boundary used by future batch ingestion from
-`knowledge/raw` into pgvector or Qdrant.
+`knowledge/raw` into Postgres metadata and Milvus vectors.
 """
 
 from pathlib import Path
