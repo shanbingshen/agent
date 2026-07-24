@@ -21,3 +21,6 @@ coverage/
 FirstAgentTest copy.ipynb
 local-dev.db
 .local-dev/
+start-lr-windows.cmd
+start-lr-windows.ps1
+start-lr.command
